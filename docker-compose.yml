@@ -1,0 +1,29 @@
+services:
+  lead-pipeline:
+    build: .
+    container_name: lead-pipeline
+    volumes:
+      - ./output:/app/src/output
+      - ./logs:/app/src/logs
+      - ./playwright-browsers:/ms-playwright
+    env_file:
+      - .env
+    ports:
+      - "9222:9222"
+    environment:
+      - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+      - POLL_INTERVAL=3600
+      - ONE_SHOT=0
+    restart: unless-stopped
+    command: ["--headless", "--export-json", "--export-csv", "--export-text"]
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:9222" ]
+      interval: 1m30s
+      timeout: 10s
+      retries: 3
