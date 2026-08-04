@@ -9,3 +9,5 @@ __pycache__/
 output/
 logs/
 .DS_Store
+playwright-browsers/
+playwright-browsers/
