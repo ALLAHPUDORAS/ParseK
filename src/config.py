@@ -10,7 +10,7 @@ TARGET_VERTICALS = ["Gambling", "Casino", "Nutra", "Crypto"]
 # GEO-Fence Exclusions (RU, BY, CIS countries)
 EXCLUDED_GEOS = {
     "RU", "BY", "CIS", "RUSSIA", "BELARUS", "СНГ", "РОССИЯ", "БЕЛАРУСЬ",
-    "RUS", "BLR", "UKRAINE", "UA"  # Excluding CIS region per instructions
+    "RUS", "BLR", "UKRAINE", "UA"
 }
 
 # Generic / Banned email prefixes to remove
@@ -35,7 +35,7 @@ USER_AGENT = (
     "Chrome/120.0.0.0 Safari/537.36"
 )
 PAGE_LOAD_TIMEOUT = 30000
-DEFAULT_MAX_LEADS = 1000
+DEFAULT_MAX_LEADS = 50000
 
 SITE_CONFIGS = {
     "Affpaying": {

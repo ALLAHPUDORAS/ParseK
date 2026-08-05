@@ -1,4 +1,4 @@
-FROM mcr.microsoft.com/playwright/python:v1.40.0-jammy
+FROM mcr.microsoft.com/playwright/python:v1.62.0-jammy
 
 # Ensure Playwright uses a stable path for browser cache
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright \
@@ -19,5 +19,5 @@ COPY . .
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
-ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
+ENTRYPOINT ["sh", "/usr/local/bin/entrypoint.sh"]
 CMD ["--headless", "--export-json", "--export-csv", "--export-text"]

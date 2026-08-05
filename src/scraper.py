@@ -8,7 +8,6 @@ from bs4 import BeautifulSoup, Comment
 from playwright.sync_api import Playwright, sync_playwright, TimeoutError as PlaywrightTimeoutError
 
 from src.config import PAGE_LOAD_TIMEOUT, SITE_CONFIGS, USER_AGENT, DEFAULT_MAX_LEADS
-from src.validator import LeadValidator
 
 logger = logging.getLogger("LeadPipeline.Scraper")
 
@@ -20,18 +19,21 @@ class Scraper:
         self.company_urls: Set[str] = set()
 
     def _get_browser_context(self, playwright: Playwright):
-        return playwright.chromium.launch(headless=self.headless, args=[
-            "--no-sandbox",
-            "--disable-dev-shm-usage",
-            "--disable-blink-features=AutomationControlled",
-        ])
+        return playwright.chromium.launch(
+            headless=self.headless,
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-blink-features=AutomationControlled",
+            ]
+        )
 
     def _normalize_url(self, base: str, href: str) -> Optional[str]:
         if not href:
             return None
 
         href = href.strip()
-        if href.startswith("javascript:") or href.startswith("#"):
+        if href.startswith("javascript:") or href.startswith("#") or href.startswith("mailto:") or href.startswith("tel:"):
             return None
 
         parsed = urlparse(href)
@@ -43,21 +45,50 @@ class Scraper:
     def _is_company_card_url(self, url: str, site_name: str) -> bool:
         if not url or url in self.company_urls:
             return False
+
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             return False
-        if site_name == "Affpaying" and "/network" in parsed.path:
-            return True
-        if site_name == "Offervault" and ("affiliate-networks" in parsed.path or "network" in parsed.path):
-            return True
-        if site_name == "Affplus" and ("offer" in parsed.path or "network" in parsed.path or "affiliate" in parsed.path):
-            return True
+
+        path = parsed.path.rstrip("/")
+        path_lower = path.lower()
+
+        # Исключаем системные и служебные разделы
+        junk_keywords = [
+            "add-network", "add-your-network", "add-program", "add-offer",
+            "login", "register", "signup", "contact", "privacy", "terms",
+            "about", "blog", "faq", "help", "support", "reviews", "news"
+        ]
+        if any(junk in path_lower for junk in junk_keywords):
+            return False
+
+        # Исключаем корень каталогов
+        if path_lower in ["/networks", "/offers", "/affiliate-networks", "/network", "/offer", ""]:
+            return False
+
+        # Фильтрация по структурам сайтов
+        if site_name == "Affpaying" or "affpaying.com" in parsed.netloc:
+            return path_lower.startswith("/network/") and len([p for p in path_lower.split("/") if p]) == 2
+        elif site_name == "Offervault" or "offervault.com" in parsed.netloc:
+            return any(dir_name in path_lower for dir_name in ["/network/", "/affiliate-networks/"])
+        elif site_name == "Affplus" or "affplus.com" in parsed.netloc:
+            return re.search(r"^/(?:n|o|details|network|offer)/[a-zA-Z0-9_-]+$", path_lower) is not None
+
+        # Резервная проверка глубины пути
+        parts = [p for p in path.split("/") if p]
+        if len(parts) >= 2:
+            first_dir = parts[0].lower()
+            if first_dir in {"network", "affiliate-networks", "n", "o", "offer", "details"}:
+                return True
+
         return False
 
     def _find_company_links(self, page, base_url: str, site_name: str) -> Set[str]:
         links = set()
         try:
-            anchors = page.query_selector_all("a")
+            page.evaluate("window.scrollTo(0, document.body.scrollHeight / 2)")
+            time.sleep(1)
+            anchors = page.query_selector_all("a[href]")
         except Exception as exc:
             logger.warning("Unable to query anchor tags: %s", exc)
             return links
@@ -71,6 +102,7 @@ class Scraper:
             except Exception:
                 continue
 
+        logger.info("Discovered %d valid company links on current page for %s", len(links), site_name)
         return links
 
     def _find_next_page(self, page, pagination_patterns: List[str]) -> Optional[str]:
@@ -81,9 +113,8 @@ class Scraper:
                     href = element.get_attribute("href")
                     if href:
                         return href
-                    # fallback: click button style links with text
                     text = element.text_content() or ""
-                    if "next" in text.lower():
+                    if "next" in text.lower() or "»" in text:
                         return href
             except Exception:
                 continue
@@ -104,7 +135,7 @@ class Scraper:
             "charset", "document", "pageview", "viewport",
             "import", "function", "return", "window", "script",
             "body", "html", "head", "link", "meta", "style",
-            "affplus", "offervault", "affpaying"
+            "affplus", "offervault", "affpaying", "telegram", "joinchat", "channel"
         }
         if handle_lower in invalid_handles:
             return False
@@ -118,39 +149,40 @@ class Scraper:
             "discord": []
         }
 
-        visible_text = self._clean_visible_text(content)
-        soup = BeautifulSoup(content, "html.parser")
-        hrefs = [a.get("href", "") for a in soup.find_all("a", href=True)]
-        combined_text = " ".join([visible_text, *hrefs])
+        if not content:
+            return contacts
 
-        for email in re.findall(r"[A-Za-z0-9_.+-]+@[A-Za-z0-9-]+\.[A-Za-z0-9-.]+", combined_text):
-            contacts["emails"].append(email.strip())
+        # 1. Поиск Email (исключаем статику и скрипты)
+        raw_emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", content)
+        for email in raw_emails:
+            email_clean = email.strip().strip(".,;:\"'")
+            if not any(junk in email_clean.lower() for junk in [".png", ".jpg", ".jpeg", ".webp", ".svg", ".css", ".js", "example", "domain", "affplus", "bootstrap", "schema.org"]):
+                contacts["emails"].append(email_clean)
 
-        for match in re.findall(r"(?:t\.me/|telegram\.me/)([A-Za-z0-9_]{5,32})", combined_text, flags=re.IGNORECASE):
-            normalized = match.strip()
-            if self._is_valid_telegram_handle(normalized):
-                contacts["telegram"].append(f"@{normalized}")
-
-        for match in re.findall(r"@([A-Za-z0-9_]{5,32})", combined_text):
+        # 2. Поиск Telegram СТРОГО по прямым ссылкам (t.me/, telegram.me/, tg://)
+        # Убран слепой поиск по одиночной @собачке, чтобы не ловить Twitter и Skype
+        tg_matches = re.findall(r"(?:t\.me/|telegram\.me/|tg://resolve\?domain=)([A-Za-z0-9_]{5,32})", content, flags=re.IGNORECASE)
+        for match in tg_matches:
             if self._is_valid_telegram_handle(match):
                 contacts["telegram"].append(f"@{match}")
 
-        for match in re.findall(r"(?:skype:|live:)([A-Za-z0-9_.:-]+)", combined_text, flags=re.IGNORECASE):
-            contacts["skype"].append(match.strip())
+        # 3. Поиск Skype (skype:, live:, skype?chat=)
+        skype_matches = re.findall(r"(?:skype:|live:|skype\?chat=)([A-Za-z0-9_.:-]+)", content, flags=re.IGNORECASE)
+        for match in skype_matches:
+            clean_skype = match.strip().strip(".,;:\"'")
+            if len(clean_skype) > 3 and not any(j in clean_skype.lower() for j in ["http", "javascript", "undefined"]):
+                contacts["skype"].append(clean_skype)
 
-        for match in re.findall(r"discord(?:\.gg|\.com/invite|app\.com/users)?/([A-Za-z0-9_#.-]+)", combined_text, flags=re.IGNORECASE):
+        # 4. Поиск Discord
+        discord_matches = re.findall(r"(?:discord\.gg/|discord\.com/invite/|discordapp\.com/users/)([A-Za-z0-9_#.-]+)", content, flags=re.IGNORECASE)
+        for match in discord_matches:
             contacts["discord"].append(match.strip())
 
+        # Дедупликация
         for key in contacts:
             contacts[key] = list(dict.fromkeys(contacts[key]))
 
         return contacts
-
-    def _safe_text(self, element) -> str:
-        try:
-            return (element.text_content() or "").strip()
-        except Exception:
-            return ""
 
     def _parse_company_card(self, page_content: str, page_url: str, source: str, vertical: str) -> Dict[str, Any]:
         soup = BeautifulSoup(page_content, "html.parser")
@@ -158,7 +190,6 @@ class Scraper:
         website = ""
         geo = ""
         status = ""
-        raw_contacts: Dict[str, Any] = {}
 
         if soup.select_one("h1"):
             name = soup.select_one("h1").get_text(strip=True)
@@ -175,7 +206,7 @@ class Scraper:
                 website = website_attr
 
         visible_text = self._clean_visible_text(page_content)
-        geo_candidates = re.findall(r"\b(EU|Europe|LATAM|Asia|Russia|Belarus|CIS|USA|UK|Canada)\b", visible_text, re.IGNORECASE)
+        geo_candidates = re.findall(r"\b(EU|Europe|LATAM|Asia|Russia|Belarus|CIS|USA|UK|Canada|Global|Worldwide)\b", visible_text, re.IGNORECASE)
         if geo_candidates:
             geo = geo_candidates[0].strip()
 
@@ -205,7 +236,15 @@ class Scraper:
 
         while True:
             logger.info("Scraping listing page %s", current_url)
-            urls.update(self._find_company_links(page, base_url, site_name))
+            
+            try:
+                page.wait_for_selector("a", timeout=5000)
+            except Exception:
+                pass
+
+            found_links = self._find_company_links(page, base_url, site_name)
+            urls.update(found_links)
+            
             if len(self.company_urls) + len(urls) >= self.max_leads:
                 break
 
@@ -220,8 +259,8 @@ class Scraper:
             visited_pages.add(next_url)
             try:
                 page.goto(next_url, timeout=PAGE_LOAD_TIMEOUT)
-                page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT)
-                time.sleep(1)
+                page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                time.sleep(2)
                 current_url = next_url
             except PlaywrightTimeoutError:
                 logger.warning("Timeout while loading next listing page %s", next_url)
@@ -255,8 +294,8 @@ class Scraper:
                         listing_url = urljoin(config["base_url"], path)
                         logger.info("Opening listing url: %s", listing_url)
                         page.goto(listing_url, timeout=PAGE_LOAD_TIMEOUT)
-                        page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT)
-                        time.sleep(1)
+                        page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+                        time.sleep(2.5)
 
                         page_urls = self._scrape_pagination(page, config["base_url"], source_name, config.get("pagination_patterns", []))
                         for item_url in page_urls:
@@ -268,6 +307,8 @@ class Scraper:
                         logger.warning("Timeout loading source listing %s %s", source_name, vertical)
                     except Exception as exc:
                         logger.exception("Failed to scrape source listing %s %s: %s", source_name, vertical, exc)
+
+            logger.info("Total unique company URLs collected: %d. Starting detailed scraping...", len(self.company_urls))
 
             for company_url in list(self.company_urls):
                 if len(raw_leads) >= self.max_leads:
@@ -287,15 +328,19 @@ class Scraper:
 
     def scrape_company_page(self, page, url: str) -> Optional[Dict[str, Any]]:
         logger.info("Opening company card: %s", url)
-        page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
-        page.wait_for_load_state("networkidle", timeout=PAGE_LOAD_TIMEOUT)
-        time.sleep(1)
-        html = page.content()
+        try:
+            page.goto(url, timeout=PAGE_LOAD_TIMEOUT)
+            page.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
+            time.sleep(1.5)
+            html = page.content()
+        except Exception as exc:
+            logger.warning("Error fetching company card %s: %s", url, exc)
+            return None
 
         source = urlparse(url).netloc
         vertical = "Unknown"
         for name, config in SITE_CONFIGS.items():
-            if config["base_url"].replace("https://", "") in source:
+            if config["base_url"].replace("https://", "").replace("http://", "") in source:
                 vertical = name
                 break
 
