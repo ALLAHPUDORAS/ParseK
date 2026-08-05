@@ -1,3 +1,45 @@
+# ParseK
+
+Кратко: ParseK — это B2B lead scraping pipeline для вертикалей Gambling / Nutra / Crypto.
+
+Ключевые изменения (последние коммиты):
+- Перенес кеш браузеров Playwright в именованный том Docker (`playwright-cache`) и использую официальный образ Playwright.
+- Добавлен `RotatingFileHandler` для логов, чтобы ограничить рост файлов журнала.
+- Полностью переработан `src/validator.py` по строгому бизнес-спеку: точная GEO-фильтрация, тонкие правила для role-емейлов (info@, support@ и т.п.), нормализация Telegram/Skype/Discord контактов.
+- `src/main.py` теперь сохраняет `validation_summary.json` с полями `total_processed`, `valid_count`, `rejected_count`, `by_reason` и `sample_rejections` (до 15 примеров).
+
+Быстрый старт (локально):
+
+1) Создайте виртуальное окружение и установите зависимости (пример для Windows PowerShell):
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+```
+
+2) Запуск пайплайна (локально, Playwright должен быть установлен):
+
+```powershell
+python -m src.main --headless --export-json
+```
+
+Docker (рекомендуется):
+
+```powershell
+docker-compose up --build -d
+```
+
+Файлы состояния и логов:
+- `logs/pipeline.log` — ротация логов настроена (5MB, 3 бэкапа).
+- `logs/validation_summary.json` — итог валидации после прогонки.
+- `output/` — экспортированные результаты (`.json`, `.csv`, `.txt`).
+
+Полезно знать:
+- Правила фильтрации email настроены так, чтобы минимизировать ложные срабатывания: `sales.john@example.com` будет пропущен, а `info-team@example.com` или `info123@example.com` — отклонены.
+- При необходимости я могу интегрировать graceful shutdown для Playwright (закрытие browser/context при SIGTERM). Напишите, если нужно.
+
+Автор и репозиторий: https://github.com/ALLAHPUDORAS/ParseK
 # B2B Lead Scraping Pipeline
 
 Automated lead scraping and validation pipeline for iGaming, Nutra, Gambling, and Crypto verticals.
