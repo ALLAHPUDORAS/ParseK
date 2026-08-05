@@ -5,7 +5,7 @@ services:
     volumes:
       - ./output:/app/src/output
       - ./logs:/app/src/logs
-      - ./playwright-browsers:/ms-playwright
+      - playwright-cache:/ms-playwright
     env_file:
       - .env
     ports:
@@ -27,3 +27,7 @@ services:
       interval: 1m30s
       timeout: 10s
       retries: 3
+
+volumes:
+  playwright-cache:
+    driver: local

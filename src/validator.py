@@ -50,12 +50,20 @@ class LeadValidator:
             return False
             
         local_part = email.split('@')[0].lower()
-        # Clean local part from any numbers or separators for prefix matching
-        clean_prefix = re.split(r'[._+0-9]', local_part)[0]
-        
-        if local_part in BANNED_EMAIL_PREFIXES or clean_prefix in BANNED_EMAIL_PREFIXES:
+
+        # Treat as role email only if the local-part *starts with* a banned prefix
+        # optionally followed only by separators or digits. This avoids
+        # rejecting legitimate addresses that *contain* banned tokens later
+        # in the local-part (e.g. "john.adminson@example.com").
+        # Example matches: info@, info1@, info-team@, support_123@ -> filtered
+        # Non-matches (kept): john.info@, adminuser@example.com
+        banned_alternatives = [re.escape(p) for p in BANNED_EMAIL_PREFIXES]
+        banned_pattern = r'^(?:' + '|'.join(banned_alternatives) + r')(?:[\W_0-9].*)?$'
+
+        if re.match(banned_pattern, local_part):
+            logger.debug("Filtered role email: %s", email)
             return False
-            
+
         return True
 
     @staticmethod

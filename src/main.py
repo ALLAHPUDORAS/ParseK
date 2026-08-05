@@ -3,6 +3,9 @@ import logging
 import os
 import sys
 from typing import List, Dict, Any
+import json
+import signal
+import threading
 
 from src.config import LOGS_DIR, OUTPUT_DIR, DEFAULT_MAX_LEADS
 from src.exporter import Exporter
@@ -10,6 +13,10 @@ from src.scraper import Scraper
 from src.validator import LeadValidator
 
 LOG_FILE = os.path.join(LOGS_DIR, "pipeline.log")
+VALIDATION_SUMMARY = os.path.join(LOGS_DIR, "validation_summary.json")
+
+# Graceful shutdown flag
+SHUTDOWN_EVENT = threading.Event()
 
 
 def configure_logging():
@@ -25,7 +32,9 @@ def configure_logging():
     console_handler.setFormatter(formatter)
     root_logger.addHandler(console_handler)
 
-    file_handler = logging.FileHandler(LOG_FILE, encoding="utf-8")
+    # Rotating file handler to limit disk usage
+    from logging.handlers import RotatingFileHandler
+    file_handler = RotatingFileHandler(LOG_FILE, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8")
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
     root_logger.addHandler(file_handler)
@@ -35,16 +44,46 @@ def validate_leads(raw_leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     validator = LeadValidator()
     valid_leads: List[Dict[str, Any]] = []
     logger = logging.getLogger("LeadPipeline.Main")
+    stats = {
+        "total": 0,
+        "valid": 0,
+        "rejected": 0,
+        "by_reason": {},
+    }
+    sample_rejections: List[Dict[str, Any]] = []
 
     for raw in raw_leads:
+        stats["total"] += 1
         is_valid, reason, processed = validator.validate_lead(raw)
         if is_valid and processed:
+            stats["valid"] += 1
             logger.info("Valid lead: %s", processed.get("name"))
             valid_leads.append(processed)
         else:
+            stats["rejected"] += 1
+            reason_key = reason or "unknown"
+            stats["by_reason"][reason_key] = stats["by_reason"].get(reason_key, 0) + 1
+            if len(sample_rejections) < 10:
+                sample_rejections.append({
+                    "name": raw.get("name"),
+                    "reason": reason,
+                    "raw_contacts": raw.get("raw_contacts", {}),
+                })
             logger.info("Lead filtered out: %s | Reason: %s", raw.get("name", "Unknown"), reason)
 
-    return valid_leads
+    logger.info(
+        "Validation summary: total=%d valid=%d rejected=%d",
+        stats["total"],
+        stats["valid"],
+        stats["rejected"],
+    )
+    for reason, cnt in stats["by_reason"].items():
+        logger.info(" - %s: %d", reason, cnt)
+
+    if sample_rejections:
+        logger.debug("Sample rejections (up to 10): %s", sample_rejections)
+
+    return valid_leads, stats, sample_rejections
 
 
 def parse_args():
@@ -69,27 +108,56 @@ def main():
     scraper = Scraper(headless=args.headless, max_leads=args.max_leads)
     exporter = Exporter()
 
-    raw_leads = scraper.scrape_source()
-    valid_leads = validate_leads(raw_leads)
+    # signal handlers for graceful shutdown
+    def _handle_signal(signum, frame):
+        logger.info("Signal %s received, requesting shutdown...", signum)
+        SHUTDOWN_EVENT.set()
 
-    if not valid_leads:
-        logger.error("No valid leads were produced after validation. Exiting.")
-        return
+    signal.signal(signal.SIGINT, _handle_signal)
+    signal.signal(signal.SIGTERM, _handle_signal)
 
-    if args.export_json:
-        exporter.to_json(valid_leads)
-    if args.export_csv:
-        exporter.to_csv(valid_leads)
-    if args.export_text:
-        exporter.to_text(valid_leads)
+    try:
+        raw_leads = scraper.scrape_source()
+        valid_leads, stats, sample_rejections = validate_leads(raw_leads)
 
-    if not any([args.export_json, args.export_csv, args.export_text]):
-        exporter.to_json(valid_leads)
-        exporter.to_csv(valid_leads)
-        exporter.to_text(valid_leads)
+        # Write validation summary to JSON for persistent metrics
+        try:
+            with open(VALIDATION_SUMMARY, "w", encoding="utf-8") as fh:
+                json.dump({"stats": stats, "sample_rejections": sample_rejections}, fh, ensure_ascii=False, indent=2)
+            logger.info("Validation summary written: %s", VALIDATION_SUMMARY)
+        except Exception as e:
+            logger.exception("Failed to write validation summary: %s", e)
 
-    logger.info("Pipeline complete. Valid leads: %d", len(valid_leads))
-    print(f"Pipeline complete. Valid leads: {len(valid_leads)}")
+        if not valid_leads:
+            logger.error("No valid leads were produced after validation. Exiting.")
+            return
+
+        if args.export_json:
+            exporter.to_json(valid_leads)
+        if args.export_csv:
+            exporter.to_csv(valid_leads)
+        if args.export_text:
+            exporter.to_text(valid_leads)
+
+        if not any([args.export_json, args.export_csv, args.export_text]):
+            exporter.to_json(valid_leads)
+            exporter.to_csv(valid_leads)
+            exporter.to_text(valid_leads)
+
+        logger.info("Pipeline complete. Valid leads: %d", len(valid_leads))
+        print(f"Pipeline complete. Valid leads: {len(valid_leads)}")
+
+    except Exception as exc:
+        logger.exception("Fatal error during pipeline run: %s", exc)
+    finally:
+        # On shutdown ensure logs/summary are flushed and exporter flushed
+        try:
+            if 'stats' in locals():
+                with open(VALIDATION_SUMMARY, "w", encoding="utf-8") as fh:
+                    json.dump({"stats": stats, "sample_rejections": locals().get('sample_rejections', [])}, fh, ensure_ascii=False, indent=2)
+                logger.info("Final validation summary written on exit: %s", VALIDATION_SUMMARY)
+        except Exception:
+            logger.exception("Failed to write final validation summary on exit")
 
 
 if __name__ == "__main__":
