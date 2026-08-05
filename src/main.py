@@ -45,43 +45,43 @@ def validate_leads(raw_leads: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     valid_leads: List[Dict[str, Any]] = []
     logger = logging.getLogger("LeadPipeline.Main")
     stats = {
-        "total": 0,
-        "valid": 0,
-        "rejected": 0,
+        "total_processed": 0,
+        "valid_count": 0,
+        "rejected_count": 0,
         "by_reason": {},
     }
     sample_rejections: List[Dict[str, Any]] = []
 
     for raw in raw_leads:
-        stats["total"] += 1
+        stats["total_processed"] += 1
         is_valid, reason, processed = validator.validate_lead(raw)
         if is_valid and processed:
-            stats["valid"] += 1
+            stats["valid_count"] += 1
             logger.info("Valid lead: %s", processed.get("name"))
             valid_leads.append(processed)
         else:
-            stats["rejected"] += 1
-            reason_key = reason or "unknown"
+            stats["rejected_count"] += 1
+            reason_key = reason or "REJECTED: Unknown"
             stats["by_reason"][reason_key] = stats["by_reason"].get(reason_key, 0) + 1
-            if len(sample_rejections) < 10:
+            if len(sample_rejections) < 15:
                 sample_rejections.append({
                     "name": raw.get("name"),
-                    "reason": reason,
+                    "reason": reason_key,
                     "raw_contacts": raw.get("raw_contacts", {}),
                 })
             logger.info("Lead filtered out: %s | Reason: %s", raw.get("name", "Unknown"), reason)
 
     logger.info(
         "Validation summary: total=%d valid=%d rejected=%d",
-        stats["total"],
-        stats["valid"],
-        stats["rejected"],
+        stats["total_processed"],
+        stats["valid_count"],
+        stats["rejected_count"],
     )
     for reason, cnt in stats["by_reason"].items():
         logger.info(" - %s: %d", reason, cnt)
 
     if sample_rejections:
-        logger.debug("Sample rejections (up to 10): %s", sample_rejections)
+        logger.debug("Sample rejections (up to 15): %s", sample_rejections)
 
     return valid_leads, stats, sample_rejections
 
@@ -123,7 +123,13 @@ def main():
         # Write validation summary to JSON for persistent metrics
         try:
             with open(VALIDATION_SUMMARY, "w", encoding="utf-8") as fh:
-                json.dump({"stats": stats, "sample_rejections": sample_rejections}, fh, ensure_ascii=False, indent=2)
+                json.dump({
+                    "total_processed": stats["total_processed"],
+                    "valid_count": stats["valid_count"],
+                    "rejected_count": stats["rejected_count"],
+                    "by_reason": stats["by_reason"],
+                    "sample_rejections": sample_rejections,
+                }, fh, ensure_ascii=False, indent=2)
             logger.info("Validation summary written: %s", VALIDATION_SUMMARY)
         except Exception as e:
             logger.exception("Failed to write validation summary: %s", e)
@@ -153,8 +159,15 @@ def main():
         # On shutdown ensure logs/summary are flushed and exporter flushed
         try:
             if 'stats' in locals():
+                final_samples = locals().get('sample_rejections', []) or sample_rejections
                 with open(VALIDATION_SUMMARY, "w", encoding="utf-8") as fh:
-                    json.dump({"stats": stats, "sample_rejections": locals().get('sample_rejections', [])}, fh, ensure_ascii=False, indent=2)
+                    json.dump({
+                        "total_processed": stats.get("total_processed", 0),
+                        "valid_count": stats.get("valid_count", 0),
+                        "rejected_count": stats.get("rejected_count", 0),
+                        "by_reason": stats.get("by_reason", {}),
+                        "sample_rejections": final_samples,
+                    }, fh, ensure_ascii=False, indent=2)
                 logger.info("Final validation summary written on exit: %s", VALIDATION_SUMMARY)
         except Exception:
             logger.exception("Failed to write final validation summary on exit")

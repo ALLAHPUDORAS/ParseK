@@ -12,16 +12,17 @@ from src.config import EXCLUDED_GEOS, BANNED_EMAIL_PREFIXES, EXCLUDED_STATUSES
 logger = logging.getLogger("LeadPipeline.Validator")
 
 # Regex Patterns
-EMAIL_REGEX = re.compile(r'[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+')
-TELEGRAM_REGEX = re.compile(r'(?:t\.me/|@|telegram\.me/)([a-zA-Z0-9_]{5,32})', re.IGNORECASE)
-SKYPE_REGEX = re.compile(r'(?:skype:|live:)([a-zA-Z0-9_.:-]+)', re.IGNORECASE)
-DISCORD_REGEX = re.compile(r'discord(?:\.gg|\.com/invite|app\.com/users)?/([a-zA-Z0-9_#.-]+)', re.IGNORECASE)
-INVALID_TELEGRAM_HANDLES = {
-    "info", "support", "supports", "admin", "media", "keyframes",
-    "font-face", "charset", "document", "pageview", "viewport",
-    "import", "function", "return", "window", "script",
-    "body", "html", "head", "link", "meta", "style",
-    "affplus", "offervault", "affpaying"
+EMAIL_REGEX = re.compile(r'^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$')
+# Telegram: captures either t.me/... or tg://resolve?domain=... or @username or plain username
+TELEGRAM_REGEX = re.compile(r"(?:(?:https?://)?(?:www\.)?(?:t\.me/|tg://resolve\?domain=)(@?[A-Za-z0-9_]{5,32}))|@([A-Za-z0-9_]{5,32})|\b([A-Za-z0-9_]{5,32})\b", re.IGNORECASE)
+SKYPE_REGEX = re.compile(r'(?:skype:)?(live:[A-Za-z0-9_.:-]+|[A-Za-z0-9_.:-]{3,})', re.IGNORECASE)
+DISCORD_INVITE_REGEX = re.compile(r'(?:discord(?:\.gg|\.com/invite)/([A-Za-z0-9_-]+))', re.IGNORECASE)
+DISCORD_TAG_REGEX = re.compile(r'([A-Za-z0-9_\-]{2,32}#[0-9]{4})')
+
+# Banned local-part prefixes (system emails)
+BANNED_PREFIXES = {
+    'info', 'support', 'admin', 'hr', 'help', 'contact', 'sales', 'billing',
+    'no-reply', 'noreply', 'jobs', 'careers'
 }
 
 class LeadValidator:
@@ -32,45 +33,57 @@ class LeadValidator:
         Returns True if GEO is allowed, False if rejected by GEO-Fence.
         """
         if not geo_str:
-            return True  # If GEO is not explicitly specified or global, allow for further check
-            
-        upper_geo = geo_str.upper()
-        # Check against explicitly excluded GEO words/codes
-        for excluded in EXCLUDED_GEOS:
-            if re.search(r'\b' + re.escape(excluded) + r'\b', upper_geo):
-                return False
-        return True
+            return True
+        upper_geo = geo_str.strip().upper()
+        # Exclude only exact matches listed in EXCLUDED_GEOS
+        return not any(upper_geo == ex for ex in EXCLUDED_GEOS)
 
     @staticmethod
     def is_valid_email(email: str) -> bool:
         """
         Validates if email is not generic/role email (info@, support@, etc.).
         """
-        if not email or not EMAIL_REGEX.match(email):
+        if not email:
             return False
-            
-        local_part = email.split('@')[0].lower()
-
-        # Treat as role email only if the local-part *starts with* a banned prefix
-        # optionally followed only by separators or digits. This avoids
-        # rejecting legitimate addresses that *contain* banned tokens later
-        # in the local-part (e.g. "john.adminson@example.com").
-        # Example matches: info@, info1@, info-team@, support_123@ -> filtered
-        # Non-matches (kept): john.info@, adminuser@example.com
-        banned_alternatives = [re.escape(p) for p in BANNED_EMAIL_PREFIXES]
-        banned_pattern = r'^(?:' + '|'.join(banned_alternatives) + r')(?:[\W_0-9].*)?$'
-
-        if re.match(banned_pattern, local_part):
-            logger.debug("Filtered role email: %s", email)
+        email = email.strip()
+        if not EMAIL_REGEX.match(email):
             return False
 
+        local = email.split('@', 1)[0].lower()
+
+        # Reject if exact match to banned prefix
+        if local in BANNED_PREFIXES:
+            logger.debug("Filtered role email (exact): %s", email)
+            return False
+
+        # If local starts with a banned prefix, inspect next char
+        for prefix in BANNED_PREFIXES:
+            if local.startswith(prefix):
+                if len(local) == len(prefix):
+                    logger.debug("Filtered role email (exact start): %s", email)
+                    return False
+                next_char = local[len(prefix):len(prefix)+1]
+                # if next char is digit -> likely generic (info123)
+                if next_char.isdigit():
+                    logger.debug("Filtered role email (prefix+digits): %s", email)
+                    return False
+                # if next char is hyphen or underscore -> generic team address
+                if next_char in ('-', '_'):
+                    logger.debug("Filtered role email (prefix+sep): %s", email)
+                    return False
+                # if next char is '.' and followed by letters -> allow (e.g. sales.john)
+                if next_char == '.':
+                    logger.debug("Allowed personal-looking dotted address: %s", email)
+                    return True
+                # if next char is letter (e.g. adminuser) -> allow
+                if next_char.isalpha():
+                    logger.debug("Allowed alphanumeric continuation: %s", email)
+                    return True
         return True
 
     @staticmethod
     def _is_valid_telegram_handle(handle: str) -> bool:
         handle_value = handle.lower().lstrip("@")
-        if handle_value in INVALID_TELEGRAM_HANDLES:
-            return False
         return bool(re.match(r"^[a-zA-Z0-9_]{5,32}$", handle_value))
 
     @staticmethod
@@ -94,7 +107,7 @@ class LeadValidator:
             if LeadValidator.is_valid_email(email_clean):
                 valid_contacts["emails"].append(email_clean)
             else:
-                logger.debug(f"Filtered out generic/banned email: {email_clean}")
+                logger.debug("Filtered out generic/banned email: %s", email_clean)
 
         # Check Telegram
         tg = raw_contacts.get("telegram", [])
@@ -102,19 +115,28 @@ class LeadValidator:
             tg = [tg]
         for handle in tg:
             normalized = handle.strip()
-            match = TELEGRAM_REGEX.search(normalized)
-            if match:
-                clean_handle = f"@{match.group(1)}"
-                if LeadValidator._is_valid_telegram_handle(clean_handle) and clean_handle not in valid_contacts["telegram"]:
-                    valid_contacts["telegram"].append(clean_handle)
-                else:
-                    logger.debug("Filtered out invalid telegram handle: %s", clean_handle)
-            else:
-                candidate = normalized if normalized.startswith("@") else f"@{normalized}"
+            # Try to extract username from various telegram formats
+            m = TELEGRAM_REGEX.search(normalized)
+            found = None
+            if m:
+                for g in m.groups():
+                    if g:
+                        found = g
+                        break
+            if found:
+                candidate = found.lstrip("@")
+                candidate = f"@{candidate}"
                 if LeadValidator._is_valid_telegram_handle(candidate) and candidate not in valid_contacts["telegram"]:
                     valid_contacts["telegram"].append(candidate)
                 else:
                     logger.debug("Filtered out invalid telegram handle: %s", candidate)
+            else:
+                # fallback: if plain token looks like tg username
+                candidate = normalized.lstrip('@')
+                if LeadValidator._is_valid_telegram_handle(candidate):
+                    cand = f"@{candidate}"
+                    if cand not in valid_contacts["telegram"]:
+                        valid_contacts["telegram"].append(cand)
 
         # Check Skype
         skype = raw_contacts.get("skype", [])
@@ -123,7 +145,10 @@ class LeadValidator:
         for handle in skype:
             match = SKYPE_REGEX.search(handle)
             if match:
-                valid_contacts["skype"].append(match.group(0))
+                # normalize to the username or live:... form
+                val = match.group(1) if match.group(1) else match.group(0)
+                if val and val not in valid_contacts["skype"]:
+                    valid_contacts["skype"].append(val)
             elif handle.strip():
                 valid_contacts["skype"].append(handle.strip())
 
@@ -132,8 +157,30 @@ class LeadValidator:
         if isinstance(discord, str):
             discord = [discord]
         for handle in discord:
-            if handle.strip():
-                valid_contacts["discord"].append(handle.strip())
+            h = handle.strip()
+            # invite links
+            m_inv = DISCORD_INVITE_REGEX.search(h)
+            m_tag = DISCORD_TAG_REGEX.search(h)
+            if m_inv:
+                invite = m_inv.group(1)
+                if invite not in valid_contacts["discord"]:
+                    valid_contacts["discord"].append(f"discord.gg/{invite}")
+            elif m_tag:
+                tag = m_tag.group(1)
+                if tag not in valid_contacts["discord"]:
+                    valid_contacts["discord"].append(tag)
+            elif h:
+                # fallback: generic username-like
+                if h not in valid_contacts["discord"]:
+                    valid_contacts["discord"].append(h)
+
+        # Deduplicate lists
+        for k in valid_contacts:
+            seen = []
+            for item in valid_contacts[k]:
+                if item not in seen:
+                    seen.append(item)
+            valid_contacts[k] = seen
 
         return valid_contacts
 
@@ -143,31 +190,40 @@ class LeadValidator:
         Performs full validation on a lead dictionary.
         Returns (is_valid, rejection_reason, processed_lead).
         """
-        name = lead.get("name", "").strip()
-        status = lead.get("status", "").strip().upper()
-        geo = lead.get("geo", "").strip()
-        
+        name = (lead.get("name") or "").strip()
+        status = (lead.get("status") or "").strip()
+        geo = (lead.get("geo") or "").strip()
+
         if not name:
-            return False, "Empty company name", None
-            
-        if status in EXCLUDED_STATUSES:
-            return False, f"Excluded status: {status}", None
-            
-        if not LeadValidator.is_geo_allowed(geo):
-            return False, f"GEO-Fence filter triggered: {geo}", None
-            
+            return False, "REJECTED: Empty company name", None
+
+        # Status filter (case-insensitive)
+        if status and status.strip().lower() in {s.lower() for s in EXCLUDED_STATUSES}:
+            return False, f"REJECTED: Banned Status ({status})", None
+
+        # Geo-fence: exclude only exact matches
+        if geo and not LeadValidator.is_geo_allowed(geo):
+            return False, f"REJECTED: Geo-Fence ({geo})", None
+
         # Process and filter contacts
         filtered_contacts = LeadValidator.filter_contacts(lead.get("raw_contacts", {}))
-        
+
         has_contacts = (
-            len(filtered_contacts["emails"]) > 0 or
-            len(filtered_contacts["telegram"]) > 0 or
-            len(filtered_contacts["skype"]) > 0 or
-            len(filtered_contacts["discord"]) > 0
+            len(filtered_contacts.get("emails", [])) > 0 or
+            len(filtered_contacts.get("telegram", [])) > 0 or
+            len(filtered_contacts.get("skype", [])) > 0 or
+            len(filtered_contacts.get("discord", [])) > 0
         )
+
         if not has_contacts:
-            return False, "No valid direct contacts (emails filtered out or empty)", None
-            
+            return False, "REJECTED: Empty Contacts", None
+
+        # Additionally detect banned exact local-part emails among valid emails
+        for e in filtered_contacts.get("emails", []):
+            local = e.split('@', 1)[0].lower()
+            if local in BANNED_PREFIXES:
+                return False, f"REJECTED: Banned Email (exact local-part match: {local}@...)", None
+
         processed_lead = {
             "name": name,
             "vertical": lead.get("vertical", "Gambling/Nutra/Crypto"),
@@ -178,5 +234,5 @@ class LeadValidator:
             "contacts": filtered_contacts,
             "source": lead.get("source", "Unknown")
         }
-        
+
         return True, None, processed_lead
