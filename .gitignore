@@ -6,6 +6,7 @@ __pycache__/
 *.log
 *.csv
 *.json
+*.session
 output/
 logs/
 .DS_Store
@@ -15,3 +16,5 @@ playwright-browsers/
 temp_*.py
 temp_*.html
 temp_git*.txt
+run_debug.txt
+runout.txt

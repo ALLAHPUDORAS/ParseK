@@ -3,6 +3,22 @@ Configuration settings for B2B Lead Scraping & Validation Pipeline.
 """
 
 import os
+from pathlib import Path
+
+# Load local environment variables from .env when present.
+ROOT_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+ENV_FILE = os.path.join(ROOT_DIR, ".env")
+
+if os.path.exists(ENV_FILE):
+    for raw_line in Path(ENV_FILE).read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        key = key.strip()
+        value = value.strip().strip('"').strip("'")
+        if key and value and key not in os.environ:
+            os.environ[key] = value
 
 # Target verticals to scrape
 TARGET_VERTICALS = ["Gambling", "Casino", "Nutra", "Crypto"]
@@ -122,9 +138,16 @@ SITE_CONFIGS = {
 }
 
 # Output directory
-OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
-LOGS_DIR = os.path.join(os.path.dirname(__file__), "logs")
+OUTPUT_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "output"))
+LOGS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.dirname(__file__)), "logs"))
+
+TG_API_ID = int(os.getenv("TG_API_ID", "0") or 0)
+TG_API_HASH = os.getenv("TG_API_HASH", "") or ""
+TG_API_ENABLED = bool(TG_API_ID and TG_API_HASH)
 
 DEFAULT_EXPORT_JSON = "leads.json"
 DEFAULT_EXPORT_CSV = "leads.csv"
 DEFAULT_EXPORT_TEXT = "leads_list.txt"
+DEFAULT_EXPORT_RAW_JSON = "raw_leads.json"
+DEFAULT_EXPORT_RAW_CSV = "raw_leads.csv"
+DEFAULT_EXPORT_RAW_XLSX = "raw_leads.xlsx"

@@ -1,8 +1,9 @@
+import asyncio
 import logging
 import re
 import time
 from typing import Any, Dict, List, Optional, Set
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin, urlparse, parse_qsl, urlencode, urlunparse
 
 from bs4 import BeautifulSoup, Comment
 from playwright.sync_api import Playwright, sync_playwright, TimeoutError as PlaywrightTimeoutError
@@ -100,7 +101,9 @@ def _worker_close():
 def _worker_process_url(url: str) -> Optional[Dict[str, Any]]:
     """Process a single URL using the worker-global page/browser. Returns parsed lead dict or None."""
     global _WORKER_PAGE
+    logger.info("Worker processing URL: %s", url)
     if not _WORKER_PAGE:
+        logger.warning("Worker page is None, creating fallback Scraper for %s", url)
         # fallback to simple per-call Scraper
         try:
             tmp = Scraper(headless=True, max_leads=1, concurrency=1)
@@ -149,22 +152,31 @@ def _worker_process_url(url: str) -> Optional[Dict[str, Any]]:
         except Exception:
             pass
 
+        logger.info("Worker navigating to %s", url)
         _WORKER_PAGE.goto(url, timeout=PAGE_LOAD_TIMEOUT)
         _WORKER_PAGE.wait_for_load_state("domcontentloaded", timeout=PAGE_LOAD_TIMEOUT)
         try:
             _WORKER_PAGE.wait_for_selector("body", timeout=3000)
         except Exception:
             pass
-        html = _WORKER_PAGE.content()
         # use Scraper instance for parsing helpers
+        logger.info("Worker starting contact extraction for %s", url)
         parser = Scraper(headless=False, max_leads=1, concurrency=1)
+        parser._reveal_hover_contacts(_WORKER_PAGE)
+        logger.info("Worker hover complete, JS extraction starting for %s", url)
+        js_contacts = parser._extract_contacts_via_javascript(_WORKER_PAGE)
+        logger.info("Worker JS extraction result for %s: tg=%d, email=%d, skype=%d", 
+                   url, len(js_contacts.get("telegram", [])), len(js_contacts.get("emails", [])), len(js_contacts.get("skype", [])))
+        html = _WORKER_PAGE.content()
         source = urlparse(url).netloc
         vertical = "Unknown"
         for name, config in SITE_CONFIGS.items():
             if config["base_url"].replace("https://", "").replace("http://", "") in source:
                 vertical = name
                 break
-        parsed = parser._parse_company_card(html, url, source, vertical)
+        logger.info("Worker parsing company card for %s", url)
+        parsed = parser._parse_company_card(html, url, source, vertical, js_contacts)
+        logger.info("Worker parsed %s: raw_contacts keys=%s", url, list(parsed.get("raw_contacts", {}).keys()))
         # release per-site slot
         try:
             if acquired and _WORKER_COUNTS is not None and _WORKER_LOCK is not None:
@@ -257,17 +269,23 @@ class Scraper:
         path = parsed.path.rstrip("/")
         path_lower = path.lower()
 
-        # Исключаем системные и служебные разделы
+        if parsed.query:
+            query_lower = parsed.query.lower()
+            if any(token in query_lower for token in ["search?", "q=", "page=", "p=", "sort="]):
+                logger.info("Filtered %s (search/pagination query)", url)
+                return False
+
         junk_keywords = [
             "add-network", "add-your-network", "add-program", "add-offer",
             "login", "register", "signup", "contact", "privacy", "terms",
             "about", "blog", "faq", "help", "support", "reviews", "news"
         ]
         if any(junk in path_lower for junk in junk_keywords):
+            logger.info("Filtered %s (junk keyword)", url)
             return False
 
-        # Исключаем корень каталогов
-        if path_lower in ["/networks", "/offers", "/affiliate-networks", "/network", "/offer", ""]:
+        if path_lower in ["/networks", "/offers", "/affiliate-networks", "/network", "/offer", "", "/search"]:
+            logger.info("Filtered %s (root path)", url)
             return False
 
         config = SITE_CONFIGS.get(site_name)
@@ -275,16 +293,15 @@ class Scraper:
             patterns = config.get("company_url_patterns", [])
             for pattern in patterns:
                 if re.search(pattern, path_lower):
+                    logger.info("ACCEPTED %s (matches pattern: %s)", url, pattern)
                     return True
-            return False
 
-        # Запасная проверка глубины пути
         parts = [p for p in path.split("/") if p]
-        if len(parts) >= 2:
-            first_dir = parts[0].lower()
-            if first_dir in {"network", "affiliate-networks", "n", "o", "offer", "details"}:
-                return True
+        if len(parts) == 1 and path_lower.startswith("/"):
+            logger.info("ACCEPTED %s (single-segment path)", url)
+            return True
 
+        logger.info("Filtered %s (fallback check failed)", url)
         return False
 
     def _is_affplus_offer_page(self, url: str) -> bool:
@@ -328,6 +345,26 @@ class Scraper:
             return sorted(candidates)[0]
         return None
 
+    def _build_next_page_url(self, current_url: str, page_number: Optional[int] = None) -> Optional[str]:
+        if not current_url:
+            return None
+
+        parsed = urlparse(current_url)
+        if not parsed.scheme or not parsed.netloc:
+            return None
+
+        query_params = dict(parse_qsl(parsed.query, keep_blank_values=True))
+        current_page = 1
+        if "page" in query_params:
+            try:
+                current_page = int(query_params.get("page", "1") or "1")
+            except (TypeError, ValueError):
+                current_page = 1
+
+        next_page = page_number if page_number is not None else current_page + 1
+        query_params["page"] = str(next_page)
+        return urlunparse(parsed._replace(query=urlencode(query_params, doseq=True)))
+
     def _build_selector_query(self, selectors: List[str]) -> str:
         return ", ".join(set(selectors))
 
@@ -358,12 +395,18 @@ class Scraper:
             logger.warning("Unable to query anchor tags: %s", exc)
             return links
 
-        for anchor in anchors:
+        logger.debug("Found %d anchor elements on page", len(anchors))
+        for i, anchor in enumerate(anchors):
             try:
                 normalized = self._extract_url_from_element(anchor, base_url)
-                if normalized and self._is_company_card_url(normalized, site_name):
-                    links.add(normalized)
-            except Exception:
+                if normalized:
+                    logger.info("  Anchor %d: %s", i, normalized)
+                    if self._is_company_card_url(normalized, site_name):
+                        links.add(normalized)
+                    else:
+                        logger.info("    -> Filtered by _is_company_card_url")
+            except Exception as e:
+                logger.info("  Anchor %d: extraction error: %s", i, e)
                 continue
 
         return links
@@ -488,6 +531,67 @@ class Scraper:
 
         return links
 
+    def extract_catalog_cards(self, page) -> List[Dict[str, str]]:
+        """Collect only company profile URLs from listing pages without triggering deep scraping."""
+        cards: List[Dict[str, str]] = []
+        try:
+            page.wait_for_selector("a[href]", timeout=5000)
+
+            js_code = """
+            () => {
+                const results = [];
+                const seenUrls = new Set();
+                const blacklist = ['search?', 'q=', 'page=', 'p=', 'sort=', '/blog', '/reviews', '/login', '/register', '/signup', '/privacy', '/terms', '/add-network'];
+
+                const links = document.querySelectorAll('a[href]');
+                links.forEach(a => {
+                    const href = a.getAttribute('href');
+                    if (!href) return;
+
+                    const lowerHref = href.toLowerCase();
+                    if (blacklist.some(token => lowerHref.includes(token))) return;
+
+                    let fullUrl = href.startsWith('http') ? href : window.location.origin + href;
+
+                    try {
+                        const urlObj = new URL(fullUrl);
+                        const host = urlObj.hostname.toLowerCase();
+                        if (!host.includes('affpaying.com') && !host.includes('affplus.com') && !host.includes('offervault.com')) return;
+
+                        const path = urlObj.pathname.replace(/\/$/, '');
+                        const parts = path.split('/').filter(Boolean);
+                        const pathLower = path.toLowerCase();
+
+                        if (parts.length !== 1 || pathLower === '/search' || pathLower === '/networks' || pathLower === '/offers' || pathLower === '/affiliate-networks') return;
+                        if (parts[0].length < 2) return;
+                        if (seenUrls.has(fullUrl)) return;
+                        seenUrls.add(fullUrl);
+
+                        let name = a.textContent.trim();
+                        if (!name || name.length < 2) {
+                            const parentCard = a.closest('.card, .network-item, tr, div');
+                            name = parentCard?.querySelector('h3, h4, .title, strong')?.textContent.trim() || parts[0];
+                        }
+                        if (!name || name.toLowerCase().includes('search results') || name.toLowerCase().includes('matching')) {
+                            return;
+                        }
+
+                        results.push({ name, url: fullUrl, slug: parts[0] });
+                    } catch (e) {
+                        // Ignore invalid URLs
+                    }
+                });
+
+                return results;
+            }
+            """
+            cards = page.evaluate(js_code)
+            logger.info("Found %d catalog cards on the current page", len(cards))
+        except Exception as e:
+            logger.warning("Failed to collect catalog cards: %s", e)
+
+        return cards
+
     def _find_next_page(self, page, pagination_patterns: List[str]) -> Optional[str]:
         def normalize_text(text: Optional[str]) -> str:
             return (text or "").strip().lower()
@@ -555,7 +659,14 @@ class Scraper:
             except Exception:
                 continue
 
-        return search_all_next_links()
+        fallback_url = search_all_next_links()
+        if fallback_url:
+            return fallback_url
+
+        current_url = getattr(page, "url", None)
+        if current_url:
+            return self._build_next_page_url(current_url)
+        return None
 
     def _clean_visible_text(self, content: str) -> str:
         soup = BeautifulSoup(content, "html.parser")
@@ -653,15 +764,337 @@ class Scraper:
             return False
         return bool(re.match(r"^[A-Za-z0-9_]{5,32}$", handle_lower))
 
+    def _capture_network_api_payloads(self, page, max_payloads: int = 20, sink: Optional[List[Any]] = None) -> List[Any]:
+        captured_payloads: List[Any] = sink if sink is not None else []
+
+        def handle_response(response) -> None:
+            try:
+                response_url = getattr(response, "url", "") or ""
+                response_url_lower = response_url.lower()
+                if not any(token in response_url_lower for token in ["api", "contact", "network", "profile", "user", "search", "offer"]):
+                    return
+
+                try:
+                    body = response.text()
+                except Exception:
+                    return
+                if not body:
+                    return
+
+                payload = None
+                try:
+                    payload = response.json()
+                except Exception:
+                    try:
+                        payload = json.loads(body)
+                    except Exception:
+                        payload = None
+
+                if isinstance(payload, (dict, list)):
+                    captured_payloads.append(payload)
+                    if len(captured_payloads) > max_payloads:
+                        captured_payloads[:] = captured_payloads[-max_payloads:]
+            except Exception:
+                pass
+
+        try:
+            page.on("response", handle_response)
+        except Exception:
+            pass
+        return captured_payloads
+
+    def _extract_contacts_from_payload(self, payload: Any) -> Dict[str, Any]:
+        contacts = {
+            "emails": [],
+            "telegram": [],
+            "discord": [],
+            "linkedin": [],
+            "twitter_x": [],
+            "skype": [],
+            "other_socials": []
+        }
+
+        if payload is None:
+            return contacts
+
+        mapping = {
+            "telegram": "telegram",
+            "tg": "telegram",
+            "skype": "skype",
+            "email": "emails",
+            "emails": "emails",
+            "mail": "emails",
+            "discord": "discord",
+            "linkedin": "linkedin",
+            "twitter": "twitter_x",
+            "twitter_x": "twitter_x",
+            "x": "twitter_x",
+            "whatsapp": "other_socials",
+            "facebook": "other_socials",
+            "instagram": "other_socials",
+            "social": "other_socials",
+        }
+
+        def add_value(contact_type: str, value: Any) -> None:
+            if value is None:
+                return
+            if isinstance(value, (list, tuple, set)):
+                for item in value:
+                    add_value(contact_type, item)
+                return
+            if not isinstance(value, str):
+                return
+
+            text = value.strip().strip(".,;:\"'")
+            if not text:
+                return
+
+            normalized = text
+            if contact_type == "telegram":
+                if text.startswith("http"):
+                    match = re.search(r"(?:t\.me/|telegram\.me/|tg://resolve\?domain=)([A-Za-z0-9_]{5,32})", text, flags=re.IGNORECASE)
+                    if match:
+                        normalized = f"@{match.group(1)}"
+                    else:
+                        normalized = None
+                elif "@" in text:
+                    handles = re.findall(r"@([A-Za-z0-9_]{5,32})", text)
+                    if handles:
+                        normalized = f"@{handles[0]}"
+                    else:
+                        normalized = None
+                elif text.startswith("tg://"):
+                    normalized = None
+                else:
+                    normalized = f"@{text.lstrip('@')}" if re.fullmatch(r"[A-Za-z0-9_]{5,32}", text) else None
+            elif contact_type == "skype":
+                lowered = text.lower()
+                if lowered.startswith("skype:"):
+                    normalized = text[6:].strip()
+                elif lowered.startswith("live:"):
+                    normalized = text[5:].strip()
+                elif lowered.startswith("skype?chat="):
+                    normalized = text[len("skype?chat="):].strip()
+                else:
+                    normalized = text
+            elif contact_type == "emails":
+                email_match = re.search(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", text)
+                if email_match:
+                    normalized = email_match.group(0)
+                else:
+                    normalized = None
+            elif contact_type == "discord":
+                normalized = text
+            elif contact_type == "linkedin":
+                normalized = text if text.startswith("http") else None
+            elif contact_type == "twitter_x":
+                normalized = text if text.startswith("http") else None
+            elif contact_type == "other_socials":
+                normalized = text if text.startswith("http") else None
+
+            if normalized:
+                contacts[contact_type].append(normalized)
+
+        def walk(node: Any) -> None:
+            if isinstance(node, dict):
+                contact_type_hint = None
+                for key, value in node.items():
+                    key_lower = str(key).lower()
+                    if key_lower in {"type", "kind", "contact_type", "contacttype"}:
+                        contact_type_hint = str(value).lower()
+                    elif key_lower in mapping:
+                        add_value(mapping[key_lower], value)
+
+                if contact_type_hint in mapping:
+                    for key, value in node.items():
+                        key_lower = str(key).lower()
+                        if key_lower in {"value", "contact", "contact_value", "handle", "username", "email", "skype", "telegram"}:
+                            add_value(mapping[contact_type_hint], value)
+
+                for key, value in node.items():
+                    if isinstance(value, (dict, list)):
+                        walk(value)
+                return
+            if isinstance(node, list):
+                for item in node:
+                    walk(item)
+
+        walk(payload)
+
+        for key in contacts:
+            contacts[key] = list(dict.fromkeys(contacts[key]))
+        return contacts
+
+    def _extract_contacts_via_javascript(self, page) -> Dict[str, Any]:
+        """
+        Извлекает контакты из DOM, атрибутов Tippy.js, объектов _tippy и срендеренных тултипов.
+        """
+        contacts = {
+            "emails": [],
+            "telegram": [],
+            "discord": [],
+            "linkedin": [],
+            "twitter_x": [],
+            "skype": [],
+            "other_socials": []
+        }
+        
+        try:
+            js_code = """
+            () => {
+                const contacts = {
+                    emails: [],
+                    telegram: [],
+                    skype: [],
+                    discord: []
+                };
+
+                const addTg = (handle) => {
+                    if (!handle) return;
+                    let clean = handle.trim();
+                    if (!clean.startsWith('@')) clean = '@' + clean;
+                    if (contacts.telegram.indexOf(clean) === -1) {
+                        contacts.telegram.push(clean);
+                    }
+                };
+
+                const addEmail = (email) => {
+                    if (!email) return;
+                    const clean = email.trim();
+                    if (!clean.endsWith('.png') && !clean.endsWith('.jpg') && !clean.endsWith('.svg') && contacts.emails.indexOf(clean) === -1) {
+                        contacts.emails.push(clean);
+                    }
+                };
+
+                const addSkype = (skype) => {
+                    if (!skype) return;
+                    const clean = skype.replace(/^(skype:|live:)/i, '').trim();
+                    if (clean.length > 3 && contacts.skype.indexOf(clean) === -1) {
+                        contacts.skype.push(clean);
+                    }
+                };
+
+                const addSocial = (value) => {
+                    if (!value) return;
+                    const clean = value.trim();
+                    if (!clean) return;
+                    if (clean.startsWith('http') && contacts.other_socials.indexOf(clean) === -1) {
+                        contacts.other_socials.push(clean);
+                    }
+                };
+
+                const addLinkedin = (value) => {
+                    if (!value) return;
+                    const clean = value.trim();
+                    if (clean.startsWith('http') && contacts.linkedin.indexOf(clean) === -1) {
+                        contacts.linkedin.push(clean);
+                    }
+                };
+
+                const addTwitter = (value) => {
+                    if (!value) return;
+                    const clean = value.trim();
+                    if (clean.startsWith('http') && contacts.twitter_x.indexOf(clean) === -1) {
+                        contacts.twitter_x.push(clean);
+                    }
+                };
+
+                // 1. Проверка уже срендеренных элементов тултипов в DOM
+                const renderedTooltips = document.querySelectorAll('.tippy-box, .tippy-content, .tooltip, [role="tooltip"]');
+                renderedTooltips.forEach(el => {
+                    const text = el.textContent || '';
+                    const tgMatches = text.match(/@([A-Za-z0-9_]{5,32})/g);
+                    if (tgMatches) tgMatches.forEach(addTg);
+
+                    const emailMatches = text.match(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g);
+                    if (emailMatches) emailMatches.forEach(addEmail);
+                });
+
+                // 2. Обход всех элементов DOM и проверка атрибутов + JS-объектов _tippy
+                const attributes = ['data-tippy-content', 'data-tippy', 'data-tooltip', 'title', 'aria-label', 'data-content'];
+                const allElements = document.querySelectorAll('*');
+
+                allElements.forEach(el => {
+                    // Проверка внутреннего объекта Tippy.js
+                    if (el._tippy && el._tippy.props && el._tippy.props.content) {
+                        const contentStr = String(el._tippy.props.content);
+                        const tgMatches = contentStr.match(/@([A-Za-z0-9_]{5,32})/g);
+                        if (tgMatches) tgMatches.forEach(addTg);
+
+                        const emailMatches = contentStr.match(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g);
+                        if (emailMatches) emailMatches.forEach(addEmail);
+                    }
+
+                    // Проверка HTML-атрибутов
+                    attributes.forEach(attr => {
+                        const value = el.getAttribute(attr);
+                        if (!value) return;
+
+                        // Извлечение Telegram (@username или t.me/username)
+                        const tgMatches = value.match(/@([A-Za-z0-9_]{5,32})/g);
+                        if (tgMatches) tgMatches.forEach(addTg);
+
+                        const tgUrlMatches = value.match(/(?:t\\.me\\/|tg:\\/\\/resolve\\?domain=)([A-Za-z0-9_]{5,32})/gi);
+                        if (tgUrlMatches) {
+                            tgUrlMatches.forEach(m => {
+                                const parts = m.split('/');
+                                const handle = parts[parts.length - 1].replace('tg://resolve?domain=', '');
+                                addTg(handle);
+                            });
+                        }
+
+                        // Извлечение Email
+                        const emailMatches = value.match(/[a-zA-Z0-9_.+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}/g);
+                        if (emailMatches) emailMatches.forEach(addEmail);
+
+                        const linkedinMatches = value.match(/https?:\/\/(?:www\.)?linkedin\.com\/(?:company|in)\/[^\s"'>]+/gi);
+                        if (linkedinMatches) linkedinMatches.forEach(addLinkedin);
+
+                        const twitterMatches = value.match(/https?:\/\/(?:www\.)?(?:x\.com|twitter\.com)\/[^\s"'>]+/gi);
+                        if (twitterMatches) twitterMatches.forEach(addTwitter);
+
+                        const otherSocialMatches = value.match(/https?:\/\/(?:www\.)?(?:wa\.me|api\.whatsapp\.com|facebook\.com|instagram\.com)\/[^\s"'>]+/gi);
+                        if (otherSocialMatches) otherSocialMatches.forEach(addSocial);
+
+                        // Извлечение Skype
+                        if (value.toLowerCase().includes('skype') || value.toLowerCase().includes('live:')) {
+                            const skypeMatches = value.match(/(?:skype:|live:)?([a-zA-Z0-9_.:-]{3,})/gi);
+                            if (skypeMatches) skypeMatches.forEach(addSkype);
+                        }
+                    });
+                });
+
+                return contacts;
+            }
+            """
+            
+            result = page.evaluate(js_code)
+            if result:
+                for key in contacts:
+                    contacts[key] = result.get(key, [])
+            
+            logger.info("JS extraction complete: tg=%d, email=%d, skype=%d, discord=%d, linkedin=%d, twitter_x=%d, other=%d", 
+                    len(contacts.get("telegram", [])), len(contacts.get("emails", [])),
+                    len(contacts.get("skype", [])), len(contacts.get("discord", [])),
+                    len(contacts.get("linkedin", [])), len(contacts.get("twitter_x", [])), len(contacts.get("other_socials", [])))
+        except Exception as e:
+            logger.warning("Failed to extract contacts via JS: %s", e)
+        
+        return contacts
+
     def _extract_contacts_from_html(self, content: str) -> Dict[str, Any]:
         contacts = {
             "emails": [],
             "telegram": [],
+            "discord": [],
+            "linkedin": [],
+            "twitter_x": [],
             "skype": [],
-            "discord": []
+            "other_socials": []
         }
 
         if not content:
+            logger.debug("Empty content for contact extraction")
             return contacts
 
         additional_values = []
@@ -678,6 +1111,7 @@ class Scraper:
         except Exception:
             additional_values = []
 
+        logger.debug("Found %d additional attribute values from HTML", len(additional_values))
         all_contact_values = [content] + additional_values
 
         # 1. Поиск Email из mailto: и видимых ссылок (исключаем статику и скрипты)
@@ -709,13 +1143,25 @@ class Scraper:
                 if self._is_valid_telegram_handle(handle):
                     contacts["telegram"].append(f"@{handle}")
 
-        # 3. Поиск Skype (skype:, live:, skype?chat=)
+        # 3. Поиск Skype (skype:, live:, skype?chat=) в обоих наборах значений
         for value in all_contact_values:
             skype_matches = re.findall(r"(?:skype:|live:|skype\?chat=)([A-Za-z0-9_.:-]+)", value, flags=re.IGNORECASE)
             for match in skype_matches:
                 clean_skype = match.strip().strip(".,;:\"'")
                 if len(clean_skype) > 3 and not any(j in clean_skype.lower() for j in ["http", "javascript", "undefined"]):
                     contacts["skype"].append(clean_skype)
+        
+        # 3b. Дополнительный поиск Skype в tooltip-значениях (могут быть в других форматах)
+        for value in additional_values:
+            if "skype" in value.lower():
+                # Ищем skype: или live: форматы, которые могут быть в tooltip
+                skype_tooltip = re.findall(r"(?:skype:|live:)?([a-zA-Z0-9_.:-]{3,})", value, flags=re.IGNORECASE)
+                for match in skype_tooltip:
+                    clean = match.strip().strip(".,;:\"'")
+                    if len(clean) > 3 and not any(j in clean.lower() for j in ["http", "javascript", "skype", "live", "undefined"]):
+                        # Проверяем что это не case где просто текст, убедимся что выглядит как skype
+                        if ":" in clean or "_" in clean or "-" in clean:
+                            contacts["skype"].append(clean)
 
         # 4. Поиск Discord
         for value in all_contact_values:
@@ -723,13 +1169,37 @@ class Scraper:
             for match in discord_matches:
                 contacts["discord"].append(match.strip())
 
+        # 5. Search for LinkedIn, X/Twitter, WhatsApp/Facebook/Instagram links
+        for value in all_contact_values:
+            linkedin_matches = re.findall(r"https?://(?:www\.)?linkedin\.com/(?:company|in)/[^\s\"'>]+", value, flags=re.IGNORECASE)
+            for match in linkedin_matches:
+                contacts["linkedin"].append(match.rstrip("/"))
+
+            twitter_matches = re.findall(r"https?://(?:www\.)?(?:x\.com|twitter\.com)/[^\s\"'>]+", value, flags=re.IGNORECASE)
+            for match in twitter_matches:
+                contacts["twitter_x"].append(match.rstrip("/"))
+
+            other_matches = re.findall(r"https?://(?:www\.)?(?:wa\.me|api\.whatsapp\.com|facebook\.com|instagram\.com)/[^\s\"'>]+", value, flags=re.IGNORECASE)
+            for match in other_matches:
+                contacts["other_socials"].append(match.rstrip("/"))
+
         # Дедупликация
         for key in contacts:
             contacts[key] = list(dict.fromkeys(contacts[key]))
 
+        logger.debug("HTML contact extraction result: %d tg, %d email, %d skype, %d discord, %d linkedin, %d twitter_x, %d other", 
+                    len(contacts.get("telegram", [])),
+                    len(contacts.get("emails", [])),
+                    len(contacts.get("skype", [])),
+                    len(contacts.get("discord", [])),
+                    len(contacts.get("linkedin", [])),
+                    len(contacts.get("twitter_x", [])),
+                    len(contacts.get("other_socials", [])))
+        
         return contacts
 
-    def _parse_company_card(self, page_content: str, page_url: str, source: str, vertical: str) -> Dict[str, Any]:
+    def _parse_company_card(self, page_content: str, page_url: str, source: str, vertical: str, js_contacts: Dict[str, Any] = None, network_payloads: Optional[List[Any]] = None) -> Dict[str, Any]:
+        logger.info("=== STARTING PARSE COMPANY CARD: %s ===", page_url)
         soup = BeautifulSoup(page_content, "html.parser")
         name = ""
         website = ""
@@ -751,7 +1221,59 @@ class Scraper:
 
         status = self._extract_company_status(soup, visible_text)
 
+        logger.info("Company: name=%s, website=%s, geo=%s", name, website, geo)
+        logger.info("JS contacts passed: %s", js_contacts is not None)
+        if js_contacts:
+            logger.info("JS contacts CONTENT: tg=%d, email=%d, skype=%d, discord=%d, linkedin=%d, twitter_x=%d, other=%d",
+                       len(js_contacts.get("telegram", [])),
+                       len(js_contacts.get("emails", [])),
+                       len(js_contacts.get("skype", [])),
+                       len(js_contacts.get("discord", [])),
+                       len(js_contacts.get("linkedin", [])),
+                       len(js_contacts.get("twitter_x", [])),
+                       len(js_contacts.get("other_socials", [])))
+        
         raw_contacts = self._extract_contacts_from_html(page_content)
+        logger.info("Raw contacts from HTML: tg=%d, email=%d, skype=%d, discord=%d, linkedin=%d, twitter_x=%d, other=%d", 
+                   len(raw_contacts.get("telegram", [])),
+                   len(raw_contacts.get("emails", [])),
+                   len(raw_contacts.get("skype", [])),
+                   len(raw_contacts.get("discord", [])),
+                   len(raw_contacts.get("linkedin", [])),
+                   len(raw_contacts.get("twitter_x", [])),
+                   len(raw_contacts.get("other_socials", [])))
+        
+        if network_payloads:
+            logger.info("Merging %d network payloads into contacts for %s", len(network_payloads), name or page_url)
+            for payload in network_payloads:
+                payload_contacts = self._extract_contacts_from_payload(payload)
+                for contact_type in ["emails", "telegram", "discord", "linkedin", "twitter_x", "skype", "other_socials"]:
+                    for contact in payload_contacts.get(contact_type, []):
+                        if contact not in raw_contacts.get(contact_type, []):
+                            raw_contacts[contact_type].append(contact)
+
+        # Комбинируем контакты из JavaScript (если доступны) с контактами из HTML
+        if js_contacts:
+            logger.info("Merging JS contacts with HTML contacts for %s", name or page_url)
+            for contact_type in ["emails", "telegram", "discord", "linkedin", "twitter_x", "skype", "other_socials"]:
+                if contact_type in js_contacts and js_contacts[contact_type]:
+                    # Добавляем JS контакты, которых нет в HTML контактах
+                    for js_contact in js_contacts[contact_type]:
+                        if js_contact not in raw_contacts.get(contact_type, []):
+                            if contact_type not in raw_contacts:
+                                raw_contacts[contact_type] = []
+                            raw_contacts[contact_type].append(js_contact)
+                            logger.info("Added JS %s: %s", contact_type, js_contact)
+
+        logger.info("Final raw_contacts for %s: %d tg, %d email, %d skype, %d discord, %d linkedin, %d twitter_x, %d other", 
+                   name or page_url,
+                   len(raw_contacts.get("telegram", [])),
+                   len(raw_contacts.get("emails", [])),
+                   len(raw_contacts.get("skype", [])),
+                   len(raw_contacts.get("discord", [])),
+                   len(raw_contacts.get("linkedin", [])),
+                   len(raw_contacts.get("twitter_x", [])),
+                   len(raw_contacts.get("other_socials", [])))
 
         return {
             "name": name,
@@ -803,6 +1325,8 @@ class Scraper:
                 selectors=company_selectors,
                 triggers=dynamic_triggers,
             )
+            logger.info("Found %d company links on page, adding to results", len(found_links))
+            urls.update(found_links)
 
             next_href = self._find_next_page(page, pagination_selectors)
             if not next_href:
@@ -930,9 +1454,12 @@ class Scraper:
 
                         for item_url in page_urls:
                             if item_url not in self.company_urls:
+                                logger.info("Adding URL to company_urls: %s", item_url)
                                 self.company_urls.add(item_url)
                                 if len(self.company_urls) >= self.max_leads:
                                     break
+                            else:
+                                logger.info("URL already in company_urls, skipping: %s", item_url)
                     except PlaywrightTimeoutError:
                         logger.warning("Timeout loading source listing %s %s", source_name, vertical)
                     except Exception as exc:
@@ -1005,42 +1532,55 @@ class Scraper:
         return raw_leads
 
     def _reveal_hover_contacts(self, page) -> None:
-        hover_selectors = [
-            "[aria-label*='Telegram']",
-            "[title*='Telegram']",
-            "[class*='telegram']",
-            "[class*='tg']",
-            "[data-tooltip*='Telegram']",
-            "[data-title*='Telegram']",
-            "a[href*='t.me/']",
-            "a[href^='tg://']",
-            "button[title*='Telegram']",
-            "button[aria-label*='Telegram']",
-            "svg[class*='telegram']",
-            "svg[title*='Telegram']",
-            "[aria-label*='Email']",
-            "[aria-label*='Mail']",
-            "[title*='Email']",
-            "[title*='Mail']",
-            "[class*='email']",
-            "[class*='mail']",
-            "a[href^='mailto:']",
-            "button[title*='Email']",
-            "button[aria-label*='Email']",
-            "svg[class*='email']",
-            "svg[class*='mail']",
-        ]
-        query = ", ".join(hover_selectors)
+        """
+        Принудительно вызывает показание тултипов через Tippy API и эмуляцию событий mouseover.
+        """
         try:
+            # 1. Принудительный показ через JavaScript для всех Tippy-элементов
+            page.evaluate("""
+                () => {
+                    document.querySelectorAll('*').forEach(el => {
+                        if (el._tippy && typeof el._tippy.show === 'function') {
+                            try { el._tippy.show(); } catch(e) {}
+                        }
+                        // Генерируем события наведения
+                        ['mouseenter', 'mouseover'].forEach(evtType => {
+                            const event = new MouseEvent(evtType, { bubbles: true, cancelable: true, view: window });
+                            el.dispatchEvent(event);
+                        });
+                    });
+                }
+            """)
+            page.wait_for_timeout(300)
+
+            # 2. Дополнительное физическое наведение Playwright на иконки контактов
+            hover_selectors = [
+                "[data-tippy-content]",
+                "[data-tippy]",
+                ".publishers-contact i",
+                ".advertisers-contact i",
+                "i.fa-telegram",
+                "i.fa-paper-plane",
+                "i.fa-envelope",
+                "a[href*='t.me']",
+                "[class*='telegram']",
+                "[class*='email']"
+            ]
+            query = ", ".join(hover_selectors)
             elements = page.query_selector_all(query)
-            for element in elements:
+            for element in elements[:20]:
                 try:
-                    element.hover()
-                    page.wait_for_timeout(500)
+                    element.hover(timeout=500)
                 except Exception:
                     continue
-        except Exception:
-            return
+
+            page.wait_for_timeout(300)
+        except Exception as e:
+            logger.warning("Error in _reveal_hover_contacts: %s", e)
+
+    async def scrape_page(self, url: str, page=None) -> Optional[Dict[str, Any]]:
+        """Async compatibility wrapper for the synchronous company-page scraper."""
+        return await asyncio.to_thread(self.scrape_company_page, page, url)
 
     def scrape_company_page(self, page, url: str) -> Optional[Dict[str, Any]]:
         logger.info("Opening company card: %s", url)
@@ -1048,14 +1588,23 @@ class Scraper:
 
         used_local_page = False
         html = None
+        js_contacts = None
+        network_payloads = None
+        
+        # DEBUG: Mark if we're saving first page
+        save_first_page = not hasattr(self, '_first_page_saved') and self.scraped_pages == 1
+        
         try:
             if page is None:
+                logger.info("Creating local page for %s", url)
                 used_local_page = True
                 with sync_playwright() as playwright:
                     browser = self._get_browser_context(playwright)
                     context = browser.new_context(user_agent=USER_AGENT, locale="en-US", accept_downloads=False)
                     local_page = context.new_page()
                     local_page.set_default_timeout(PAGE_LOAD_TIMEOUT)
+                    network_payloads: List[Any] = []
+                    self._capture_network_api_payloads(local_page, sink=network_payloads)
                     self._retry_action(
                         lambda: local_page.goto(url, timeout=PAGE_LOAD_TIMEOUT),
                         action_name=f"navigate to company card {url}",
@@ -1068,11 +1617,45 @@ class Scraper:
                         local_page.wait_for_selector("body", timeout=3000)
                     except Exception:
                         pass
+                    
+                    # Wait longer for JS/React to finish rendering company-specific content
+                    # This is critical because data loads dynamically
+                    logger.info("Waiting for company content to load dynamically for %s", url)
+                    try:
+                        # Wait for networkidle to ensure all JS/React rendering is done
+                        local_page.wait_for_load_state("networkidle", timeout=8000)
+                        logger.info("Network idle reached for %s", url)
+                    except Exception as e:
+                        logger.warning("Network idle timeout for %s (may still have loaded): %s", url, e)
+                        # Add extra time for React to render
+                        local_page.wait_for_timeout(2000)
+                    
+                    logger.info("Starting hover reveal and JS extraction for %s", url)
                     self._reveal_hover_contacts(local_page)
+                    logger.info("Hover reveal completed, starting JS extraction for %s", url)
+                    # Извлекаем контакты через JavaScript перед получением HTML
+                    js_contacts = self._extract_contacts_via_javascript(local_page)
+                    logger.info("JavaScript extraction completed for %s: tg=%d, email=%d, skype=%d", 
+                               url, len(js_contacts.get("telegram", [])), len(js_contacts.get("emails", [])), len(js_contacts.get("skype", [])))
                     html = local_page.content()
+                    
+                    # DEBUG: Save first page HTML for inspection
+                    if save_first_page:
+                        try:
+                            sample_file = os.path.join(LOGS_DIR, 'first_page_sample.html')
+                            with open(sample_file, 'w', encoding='utf-8') as f:
+                                f.write(html)
+                            logger.info("Saved first page HTML sample to: %s", sample_file)
+                            self._first_page_saved = True
+                        except Exception as e:
+                            logger.exception("Failed to save HTML sample: %s", e)
+                    
                     context.close()
                     browser.close()
             else:
+                logger.info("Using shared page for %s", url)
+                network_payloads: List[Any] = []
+                self._capture_network_api_payloads(page, sink=network_payloads)
                 self._retry_action(
                     lambda: page.goto(url, timeout=PAGE_LOAD_TIMEOUT),
                     action_name=f"navigate to company card {url}",
@@ -1085,13 +1668,44 @@ class Scraper:
                     page.wait_for_selector("body", timeout=3000)
                 except Exception:
                     pass
+                
+                # Wait longer for JS/React to finish rendering company-specific content
+                # This is critical because data loads dynamically
+                logger.info("Waiting for company content to load dynamically for %s", url)
+                try:
+                    # Wait for networkidle to ensure all JS/React rendering is done
+                    page.wait_for_load_state("networkidle", timeout=8000)
+                    logger.info("Network idle reached for %s", url)
+                except Exception as e:
+                    logger.warning("Network idle timeout for %s (may still have loaded): %s", url, e)
+                    # Add extra time for React to render
+                    page.wait_for_timeout(2000)
+                
+                logger.info("Starting hover reveal and JS extraction for %s", url)
                 self._reveal_hover_contacts(page)
+                logger.info("Hover reveal completed, starting JS extraction for %s", url)
+                # Извлекаем контакты через JavaScript перед получением HTML
+                js_contacts = self._extract_contacts_via_javascript(page)
+                logger.info("JavaScript extraction completed for %s: tg=%d, email=%d, skype=%d", 
+                           url, len(js_contacts.get("telegram", [])), len(js_contacts.get("emails", [])), len(js_contacts.get("skype", [])))
                 html = page.content()
+                
+                # DEBUG: Save first page HTML for inspection
+                if save_first_page:
+                    try:
+                        sample_file = os.path.join(LOGS_DIR, 'first_page_sample.html')
+                        with open(sample_file, 'w', encoding='utf-8') as f:
+                            f.write(html)
+                        logger.info("Saved first page HTML sample to: %s", sample_file)
+                        self._first_page_saved = True
+                    except Exception as e:
+                        logger.exception("Failed to save HTML sample: %s", e)
         except Exception as exc:
             logger.warning("Error fetching company card %s: %s", url, exc)
             self.failed_pages += 1
             return None
 
+        logger.info("Parsing company card %s", url)
         source = urlparse(url).netloc
         vertical = "Unknown"
         for name, config in SITE_CONFIGS.items():
@@ -1099,7 +1713,7 @@ class Scraper:
                 vertical = name
                 break
 
-        return self._parse_company_card(html, url, source, vertical)
+        return self._parse_company_card(html, url, source, vertical, js_contacts, network_payloads)
 
     def _state_file(self) -> str:
         return os.path.join(LOGS_DIR, "scraper_state.json")

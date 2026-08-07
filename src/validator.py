@@ -3,10 +3,18 @@ Validator Module: Filters companies by GEO, validates contacts via Regex,
 filters out generic emails (info@, support@, etc.), and ensures data cleanliness.
 """
 
-import re
+import asyncio
 import logging
+import re
 from typing import Dict, Any, Optional, List, Tuple
+
+import dns.asyncresolver as asyncresolver
+import dns.exception as dns_exception
+import dns.resolver as dns_resolver
+
 from src.config import EXCLUDED_GEOS, BANNED_EMAIL_PREFIXES, EXCLUDED_STATUSES
+from src.geo_filter import GeoFilter
+from src.validators.telegram_validator import validate_telegram_handles
 
 logger = logging.getLogger("LeadPipeline.Validator")
 
@@ -23,12 +31,15 @@ class LeadValidator:
     def is_geo_allowed(geo_str: str) -> bool:
         """
         Checks if the GEO string contains excluded regions (RU, BY, CIS).
-        Returns True if GEO is allowed, False if rejected by GEO-Fence.
+        Returns True if GEO is allowed, False only for explicit CIS indicators.
         """
         if not geo_str:
             return True
 
         upper_geo = geo_str.strip().upper()
+        if upper_geo in {"GLOBAL", "WORLDWIDE", "WORLD", "INTERNATIONAL", "ALL"}:
+            return True
+
         pattern = r"\b(?:" + "|".join(re.escape(ex) for ex in EXCLUDED_GEOS) + r")\b"
         return re.search(pattern, upper_geo) is None
 
@@ -73,7 +84,35 @@ class LeadValidator:
                 if next_char.isalpha():
                     logger.debug("Allowed alphanumeric continuation: %s", email)
                     return True
+
+        domain = email.rsplit('@', 1)[1].lower()
+        if not LeadValidator._has_mx_records(domain):
+            logger.debug("Filtered out email with no MX records: %s", email)
+            return False
+
         return True
+
+    @staticmethod
+    def _has_mx_records(domain: str, timeout: float = 2.0) -> bool:
+        domain = (domain or "").strip().lower().rstrip(".")
+        if not domain or domain in {"localhost", "localdomain"}:
+            return False
+
+        async def _check() -> bool:
+            try:
+                answers = await asyncio.wait_for(asyncresolver.resolve(domain, "MX", lifetime=timeout), timeout=timeout)
+                return bool(answers)
+            except (asyncio.TimeoutError, dns_exception.Timeout, dns_resolver.NXDOMAIN, dns_resolver.NoAnswer, dns_resolver.NoNameservers, dns_exception.DNSException):
+                return False
+
+        try:
+            return asyncio.run(_check())
+        except RuntimeError:
+            loop = asyncio.new_event_loop()
+            try:
+                return loop.run_until_complete(asyncio.wait_for(_check(), timeout=timeout))
+            finally:
+                loop.close()
 
     @staticmethod
     def _is_valid_telegram_handle(handle: str) -> bool:
@@ -88,8 +127,11 @@ class LeadValidator:
         valid_contacts = {
             "emails": [],
             "telegram": [],
+            "discord": [],
+            "linkedin": [],
+            "twitter_x": [],
             "skype": [],
-            "discord": []
+            "other_socials": []
         }
         
         # Check Emails
@@ -107,9 +149,9 @@ class LeadValidator:
         tg = raw_contacts.get("telegram", [])
         if isinstance(tg, str):
             tg = [tg]
+        telegram_candidates: List[str] = []
         for handle in tg:
             normalized = handle.strip()
-            # Try to extract username from various telegram formats
             m = TELEGRAM_REGEX.search(normalized)
             found = None
             if m:
@@ -120,17 +162,14 @@ class LeadValidator:
             if found:
                 candidate = found.lstrip("@")
                 candidate = f"@{candidate}"
-                if LeadValidator._is_valid_telegram_handle(candidate) and candidate not in valid_contacts["telegram"]:
-                    valid_contacts["telegram"].append(candidate)
-                else:
-                    logger.debug("Filtered out invalid telegram handle: %s", candidate)
+                if LeadValidator._is_valid_telegram_handle(candidate):
+                    telegram_candidates.append(candidate)
             else:
-                # fallback: if plain token looks like tg username
                 candidate = normalized.lstrip('@')
                 if LeadValidator._is_valid_telegram_handle(candidate):
-                    cand = f"@{candidate}"
-                    if cand not in valid_contacts["telegram"]:
-                        valid_contacts["telegram"].append(cand)
+                    telegram_candidates.append(f"@{candidate}")
+
+        valid_contacts["telegram"] = telegram_candidates
 
         # Check Skype
         skype = raw_contacts.get("skype", [])
@@ -168,6 +207,16 @@ class LeadValidator:
                 if h not in valid_contacts["discord"]:
                     valid_contacts["discord"].append(h)
 
+        # Additional social platforms
+        for contact_type in ["linkedin", "twitter_x", "other_socials"]:
+            values = raw_contacts.get(contact_type, [])
+            if isinstance(values, str):
+                values = [values]
+            for value in values:
+                clean = str(value).strip()
+                if clean and clean not in valid_contacts[contact_type]:
+                    valid_contacts[contact_type].append(clean)
+
         # Deduplicate lists
         for k in valid_contacts:
             seen = []
@@ -188,29 +237,46 @@ class LeadValidator:
         status = (lead.get("status") or "").strip()
         geo = (lead.get("geo") or "").strip()
 
+        def _reject(reason: str) -> Tuple[bool, str, None]:
+            logger.warning("[DROPPED] Lead '%s' -> Reason: %s", name or "Unknown", reason)
+            return False, reason, None
+
         if not name:
-            return False, "REJECTED: Empty company name", None
+            return _reject("REJECTED: Empty company name")
 
         # Status filter (case-insensitive)
         if status and status.strip().lower() in {s.lower() for s in EXCLUDED_STATUSES}:
-            return False, f"REJECTED: Banned Status ({status})", None
+            return _reject(f"REJECTED: Banned Status ({status})")
 
-        # Geo-fence: exclude only exact matches
+        # Geo-fence and brand/contact blocking checks
         if geo and not LeadValidator.is_geo_allowed(geo):
-            return False, f"REJECTED: Geo-Fence ({geo})", None
+            return _reject(f"REJECTED: Explicit geo block ({geo})")
 
-        # Process and filter contacts
-        filtered_contacts = LeadValidator.filter_contacts(lead.get("raw_contacts", {}))
+        filtered_contacts = LeadValidator.filter_contacts(lead.get("raw_contacts", {}) or lead.get("contacts", {}))
+        lead_for_geo = dict(lead)
+        lead_for_geo["raw_contacts"] = filtered_contacts
+        geo_allowed, geo_reason = GeoFilter.filter_lead(lead_for_geo)
+        if not geo_allowed:
+            return _reject(f"REJECTED: {geo_reason}")
 
         has_contacts = (
             len(filtered_contacts.get("emails", [])) > 0 or
             len(filtered_contacts.get("telegram", [])) > 0 or
             len(filtered_contacts.get("skype", [])) > 0 or
-            len(filtered_contacts.get("discord", [])) > 0
+            len(filtered_contacts.get("discord", [])) > 0 or
+            len(filtered_contacts.get("linkedin", [])) > 0 or
+            len(filtered_contacts.get("twitter_x", [])) > 0 or
+            len(filtered_contacts.get("other_socials", [])) > 0
         )
 
         if not has_contacts:
-            return False, "REJECTED: Empty Contacts", None
+            return _reject("REJECTED: Empty Contacts")
+
+        validated_telegram = validate_telegram_handles(filtered_contacts.get("telegram", []))
+        filtered_contacts["telegram"] = validated_telegram
+
+        if not filtered_contacts["emails"] and not filtered_contacts["telegram"]:
+            return _reject("REJECTED: No valid emails or active Telegram handles")
 
         # Additionally detect banned exact local-part emails among valid emails
         for e in filtered_contacts.get("emails", []):
@@ -230,3 +296,9 @@ class LeadValidator:
         }
 
         return True, None, processed_lead
+
+    def is_lead_allowed(self, lead: Dict[str, Any]) -> Tuple[bool, Optional[str], Optional[Dict[str, Any]]]:
+        """
+        Runs full lead validation and returns whether the lead is allowed.
+        """
+        return self.validate_lead(lead)

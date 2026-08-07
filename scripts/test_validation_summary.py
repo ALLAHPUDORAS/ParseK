@@ -11,7 +11,7 @@ raw_leads = [
     {"name": "RU Company", "raw_contacts": {"emails": ["ivan@example.ru"]}, "geo": "RU", "status": "Active", "vertical": "Gambling", "source": "Test"},
 ]
 
-valid = validate_leads(raw_leads)
-print('Valid leads count:', len(valid))
-for v in valid:
-    print(v['name'], v.get('contacts'))
+valid_leads, stats, sample_rejections = validate_leads(raw_leads)
+print('Valid leads count:', len(valid_leads))
+for lead in valid_leads:
+    print(lead['name'], lead.get('contacts'))
