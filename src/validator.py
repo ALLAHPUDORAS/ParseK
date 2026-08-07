@@ -3,7 +3,6 @@ Validator Module: Filters companies by GEO, validates contacts via Regex,
 filters out generic emails (info@, support@, etc.), and ensures data cleanliness.
 """
 
-import os
 import re
 import logging
 from typing import Dict, Any, Optional, List, Tuple
@@ -19,12 +18,6 @@ SKYPE_REGEX = re.compile(r'(?:skype:)?(live:[A-Za-z0-9_.:-]+|[A-Za-z0-9_.:-]{3,}
 DISCORD_INVITE_REGEX = re.compile(r'(?:discord(?:\.gg|\.com/invite)/([A-Za-z0-9_-]+))', re.IGNORECASE)
 DISCORD_TAG_REGEX = re.compile(r'([A-Za-z0-9_\-]{2,32}#[0-9]{4})')
 
-# Banned local-part prefixes (system emails)
-BANNED_PREFIXES = {
-    'info', 'support', 'admin', 'hr', 'help', 'contact', 'sales', 'billing',
-    'no-reply', 'noreply', 'jobs', 'careers'
-}
-
 class LeadValidator:
     @staticmethod
     def is_geo_allowed(geo_str: str) -> bool:
@@ -34,9 +27,10 @@ class LeadValidator:
         """
         if not geo_str:
             return True
+
         upper_geo = geo_str.strip().upper()
-        # Exclude only exact matches listed in EXCLUDED_GEOS
-        return not any(upper_geo == ex for ex in EXCLUDED_GEOS)
+        pattern = r"\b(?:" + "|".join(re.escape(ex) for ex in EXCLUDED_GEOS) + r")\b"
+        return re.search(pattern, upper_geo) is None
 
     @staticmethod
     def is_valid_email(email: str) -> bool:
@@ -52,12 +46,12 @@ class LeadValidator:
         local = email.split('@', 1)[0].lower()
 
         # Reject if exact match to banned prefix
-        if local in BANNED_PREFIXES:
+        if local in BANNED_EMAIL_PREFIXES:
             logger.debug("Filtered role email (exact): %s", email)
             return False
 
         # If local starts with a banned prefix, inspect next char
-        for prefix in BANNED_PREFIXES:
+        for prefix in BANNED_EMAIL_PREFIXES:
             if local.startswith(prefix):
                 if len(local) == len(prefix):
                     logger.debug("Filtered role email (exact start): %s", email)
@@ -221,7 +215,7 @@ class LeadValidator:
         # Additionally detect banned exact local-part emails among valid emails
         for e in filtered_contacts.get("emails", []):
             local = e.split('@', 1)[0].lower()
-            if local in BANNED_PREFIXES:
+            if local in BANNED_EMAIL_PREFIXES:
                 return False, f"REJECTED: Banned Email (exact local-part match: {local}@...)", None
 
         processed_lead = {

@@ -8,10 +8,17 @@ import signal
 import threading
 import time
 
-from src.config import LOGS_DIR, OUTPUT_DIR, DEFAULT_MAX_LEADS
+from src.config import LOGS_DIR, OUTPUT_DIR, DEFAULT_MAX_LEADS, DEFAULT_POLL_INTERVAL
 from src.exporter import Exporter
 from src.scraper import Scraper
 from src.validator import LeadValidator
+import socket
+from http.server import HTTPServer, BaseHTTPRequestHandler
+try:
+    from prometheus_client import start_http_server, Summary, Counter
+    PROM_AVAILABLE = True
+except Exception:
+    PROM_AVAILABLE = False
 
 LOG_FILE = os.path.join(LOGS_DIR, "pipeline.log")
 VALIDATION_SUMMARY = os.path.join(LOGS_DIR, "validation_summary.json")
@@ -95,6 +102,7 @@ def parse_args():
     parser.add_argument("--export-json", action="store_true", help="Export valid leads to JSON")
     parser.add_argument("--export-csv", action="store_true", help="Export valid leads to CSV")
     parser.add_argument("--export-text", action="store_true", help="Export valid leads to plain text list")
+    parser.add_argument("--one-shot", action="store_true", help="Run pipeline once and exit")
     return parser.parse_args()
 
 
@@ -107,6 +115,7 @@ def run_pipeline(args):
     scraper = Scraper(headless=args.headless, max_leads=args.max_leads)
     exporter = Exporter()
 
+    start_time = time.monotonic()
     raw_leads = scraper.scrape_source()
     if SHUTDOWN_EVENT.is_set():
         return
@@ -122,6 +131,12 @@ def run_pipeline(args):
                 "rejected_count": stats["rejected_count"],
                 "by_reason": stats["by_reason"],
                 "sample_rejections": sample_rejections,
+                "scraper_metrics": {
+                    "scraped_pages": getattr(scraper, "scraped_pages", 0),
+                    "failed_pages": getattr(scraper, "failed_pages", 0),
+                    "skipped_urls": getattr(scraper, "skipped_urls", 0),
+                },
+                "time_spent_seconds": round(time.monotonic() - start_time, 2),
             }, fh, ensure_ascii=False, indent=2)
         logger.info("Validation summary written: %s", VALIDATION_SUMMARY)
     except Exception as e:
@@ -150,6 +165,38 @@ def run_pipeline(args):
 def main():
     configure_logging()
     logger = logging.getLogger("LeadPipeline.Main")
+    # start lightweight HTTP endpoints for health and metrics
+    def _start_health_server():
+        class _HealthHandler(BaseHTTPRequestHandler):
+            def do_GET(self):
+                if self.path == "/health":
+                    self.send_response(200)
+                    self.send_header("Content-Type", "application/json")
+                    self.end_headers()
+                    self.wfile.write(b'{"status":"ok"}')
+                else:
+                    self.send_response(404)
+                    self.end_headers()
+
+            def log_message(self, format, *args):
+                return
+
+        try:
+            server = HTTPServer(("0.0.0.0", 8000), _HealthHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            logger.info("Health server listening on :8000/health")
+        except Exception:
+            logger.exception("Failed to start health server on :8000")
+
+    _start_health_server()
+
+    if PROM_AVAILABLE:
+        try:
+            start_http_server(8001)
+            logger.info("Prometheus metrics available on :8001/metrics")
+        except Exception:
+            logger.exception("Failed to start Prometheus metrics server")
     args = parse_args()
 
     # signal handlers for graceful shutdown
@@ -160,7 +207,22 @@ def main():
     signal.signal(signal.SIGINT, _handle_signal)
     signal.signal(signal.SIGTERM, _handle_signal)
 
-    DELAY_HOURS = 4  # Пауза между бесконечными кругами сканирования (в часах)
+    is_one_shot = args.one_shot or os.getenv("ONE_SHOT") == "1"
+
+    if is_one_shot:
+        logger.info("One-shot mode enabled. Running single pipeline cycle...")
+        try:
+            run_pipeline(args)
+        except Exception as exc:
+            logger.exception("Fatal error during pipeline run: %s", exc)
+            sys.exit(1)
+        return
+
+    poll_interval_env = os.getenv("POLL_INTERVAL")
+    if poll_interval_env and poll_interval_env.isdigit():
+        delay_seconds = int(poll_interval_env)
+    else:
+        delay_seconds = DEFAULT_POLL_INTERVAL
 
     while not SHUTDOWN_EVENT.is_set():
         try:
@@ -171,10 +233,10 @@ def main():
         if SHUTDOWN_EVENT.is_set():
             break
 
-        logger.info(f"Cycle finished. Waiting for {DELAY_HOURS} hours before the next scraping run...")
+        logger.info("Cycle finished. Waiting for %d seconds before the next scraping run...", delay_seconds)
         
         # Ожидание с возможностью прерывания по сигналу
-        for _ in range(DELAY_HOURS * 360):
+        for _ in range(max(1, delay_seconds // 10)):
             if SHUTDOWN_EVENT.is_set():
                 break
             time.sleep(10)

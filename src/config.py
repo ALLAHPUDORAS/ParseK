@@ -36,6 +36,37 @@ USER_AGENT = (
 )
 PAGE_LOAD_TIMEOUT = 30000
 DEFAULT_MAX_LEADS = 50000
+DEFAULT_CONCURRENCY_4GB = 3
+DEFAULT_POLL_INTERVAL = 4 * 3600
+
+PAGINATION_SELECTORS = [
+    "a[rel='next']",
+    "a.next",
+    "li.next a",
+    "button[aria-label='Next']",
+]
+
+COMPANY_CARD_SELECTORS = [
+    "a[href]",
+    "[data-href]",
+    "[data-url]",
+    "[data-company-url]",
+    "[data-card-url]",
+    "[onclick]",
+]
+
+DYNAMIC_CARD_TRIGGERS = [
+    "button[onclick]",
+    "[data-card-url]",
+    "[data-card-toggle]",
+    "[data-href]",
+    "[data-url]",
+    "[onclick]",
+    "[role='button']",
+    ".network-card",
+    ".offer-card",
+    ".card-preview",
+]
 
 SITE_CONFIGS = {
     "Affpaying": {
@@ -46,7 +77,16 @@ SITE_CONFIGS = {
             "Nutra": "/networks/?industry=Nutra",
             "Crypto": "/networks/?industry=Crypto",
         },
-        "pagination_patterns": ["a[rel='next']", "a.next", "a:has(span:contains('Next'))"],
+        "search_page_template": "/search?q={vertical}&page={page}",
+        "max_search_pages": 5,
+        "pagination_selectors": ["a[rel='next']", "a.next", ".pagination a.next", "a[aria-label='Next']"],
+        "company_card_selectors": COMPANY_CARD_SELECTORS,
+        "dynamic_card_triggers": DYNAMIC_CARD_TRIGGERS,
+        # site-specific extra triggers/selectors
+        "extra_triggers": ["text=All Categories", ".network-list", ".networks", ".network-card a"],
+        "company_url_patterns": [r"^/network/[^/]+$"],
+        "crawl_delay": 1,
+        "max_concurrency": 2,
     },
     "Offervault": {
         "base_url": OFFERVAULT_BASE_URL,
@@ -56,7 +96,12 @@ SITE_CONFIGS = {
             "Nutra": "/affiliate-networks?vertical=Nutra",
             "Crypto": "/affiliate-networks?vertical=Crypto",
         },
-        "pagination_patterns": ["a[rel='next']", "a.next", "li.next a"],
+        "pagination_selectors": ["a[rel='next']", "a.next", "li.next a", ".pagination a.next"],
+        "company_card_selectors": COMPANY_CARD_SELECTORS,
+        "dynamic_card_triggers": DYNAMIC_CARD_TRIGGERS,
+        "company_url_patterns": [r"^/(?:network|affiliate-networks)/[^/]+$"],
+        "crawl_delay": 2,
+        "max_concurrency": 2,
     },
     "Affplus": {
         "base_url": AFFPLUS_BASE_URL,
@@ -66,7 +111,13 @@ SITE_CONFIGS = {
             "Nutra": "/offers?vertical=Nutra",
             "Crypto": "/offers?vertical=Crypto",
         },
-        "pagination_patterns": ["a[rel='next']", "a.next", "button[aria-label='Next']"],
+        "pagination_selectors": ["a[rel='next']", "a.next", "button[aria-label='Next']", ".pagination a.next"],
+        "company_card_selectors": COMPANY_CARD_SELECTORS,
+        "dynamic_card_triggers": DYNAMIC_CARD_TRIGGERS,
+        "extra_triggers": [".offers-list", ".offer-card a"],
+        "company_url_patterns": [r"^/(?:n|o|details|network|offer)/[a-zA-Z0-9_-]+$"],
+        "crawl_delay": 1,
+        "max_concurrency": 2,
     },
 }
 

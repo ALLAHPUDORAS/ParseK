@@ -8,8 +8,6 @@ services:
       - playwright-cache:/ms-playwright
     env_file:
       - .env
-    ports:
-      - "9222:9222"
     environment:
       - PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
       - POLL_INTERVAL=3600
@@ -23,8 +21,8 @@ services:
         max-file: "3"
 
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:9222" ]
-      interval: 1m30s
+      test: ["CMD-SHELL", "wget --spider --quiet http://localhost:8000/health || exit 1"]
+      interval: 30s
       timeout: 10s
       retries: 3
 
