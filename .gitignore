@@ -10,3 +10,8 @@ output/
 logs/
 .DS_Store
 playwright-browsers/
+
+# Temporary inspection files created during development
+temp_*.py
+temp_*.html
+temp_git*.txt
