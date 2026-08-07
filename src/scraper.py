@@ -668,7 +668,7 @@ class Scraper:
         try:
             soup = BeautifulSoup(content, "html.parser")
             for element in soup.find_all(True):
-                for attr_name in ["data-tippy", "data-tooltip", "data-title", "title", "aria-label", "alt", "data-content"]:
+                for attr_name in ["data-tippy", "data-tippy-content", "data-tooltip", "data-title", "title", "aria-label", "alt", "data-content"]:
                     attr_value = element.get(attr_name)
                     if attr_value:
                         if isinstance(attr_value, list):
