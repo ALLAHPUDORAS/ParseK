@@ -183,3 +183,30 @@ Use these messages when splitting future work into clean commits by folder or fe
 - If Git push fails due to large files, ensure `playwright-browsers/` is ignored and not tracked.
 - If Playwright fails inside Docker, verify `PLAYWRIGHT_BROWSERS_PATH=/ms-playwright` and that the mounted directory contains the browser cache.
 - For browser download issues, remove the volume contents and `docker compose up --build` again.
+
+## Health и метрики
+
+- Сервис предоставляет HTTP health endpoint: `GET /health` на порту `8000`. Возвращает `200` и JSON `{ "status": "ok" }`.
+- При установленном пакете `prometheus-client` запускается Prometheus metrics endpoint на порту `8001` по URL `/metrics`.
+- `docker-compose.yml` настроен на проверку `http://localhost:8000/health` в качестве healthcheck контейнера.
+
+Пример запуска:
+
+```powershell
+docker compose up --build -d
+curl http://localhost:8000/health
+curl http://localhost:8001/metrics
+```
+
+Дополнительно:
+
+- `src/main.py` поддерживает флаг CLI `--one-shot` для одиночного запуска без цикла.
+- Параметр окружения `POLL_INTERVAL` задаёт интервал между циклическими запусками.
+- После выполнения цикла в `logs/validation_summary.json` сохраняются метрики:
+  - `total_processed`
+  - `valid_count`
+  - `rejected_count`
+  - `by_reason`
+  - `sample_rejections`
+  - `scraper_metrics` (`scraped_pages`, `failed_pages`, `skipped_urls`)
+  - `time_spent_seconds`
